@@ -209,6 +209,56 @@ const BDM_REPLACES: Record<string, string> = Object.fromEntries([
   ...BDM_VARIED.map((p) => [`update-vary:BlockDeviceMappings${p}`, BDM_REASON]),
 ]);
 
+/**
+ * go-to-k/cdkd#5630: CloudFormation applies PropagateTagsToVolumeOnCreation at
+ * launch only (measured us-east-1, 2026-11-04: a Tags change and the flag's
+ * removal both left the volume tags as they were), so update() sends nothing
+ * for it.
+ */
+const PROPAGATE_REASON =
+  'PropagateTagsToVolumeOnCreation acts at launch only (CloudFormation measured, go-to-k/cdkd#5630), so an update sends nothing for it';
+const PROPAGATE_SILENT: Record<string, string> = Object.fromEntries(
+  ['update-add', 'update-remove', 'update-vary'].map((d) => [
+    `${d}:PropagateTagsToVolumeOnCreation`,
+    PROPAGATE_REASON,
+  ])
+);
+
+/**
+ * go-to-k/cdkd#5630: adding AdditionalInfo to a running instance, or removing
+ * it, completes with no change in CloudFormation (measured us-east-1,
+ * 2026-11-04; EC2 refuses it at launch), so update() sends nothing for it.
+ */
+const ADDITIONAL_INFO_REASON =
+  'AdditionalInfo is a launch-only input; CloudFormation changes nothing for it on an update (measured, go-to-k/cdkd#5630), so update() sends nothing';
+const ADDITIONAL_INFO_SILENT: Record<string, string> = Object.fromEntries(
+  ['update-add', 'update-remove', 'update-vary'].map((d) => [
+    `${d}:AdditionalInfo`,
+    ADDITIONAL_INFO_REASON,
+  ])
+);
+
+/**
+ * go-to-k/cdkd#5630, CloudFormation measured (us-east-1, 2026-11-04): removing
+ * the whole PrivateDnsNameOptions block creates a new instance (the engine's
+ * conditional replacement; `update()` refuses one that reaches it), and
+ * removing one member fails the update ("No valid attributes specified"), so
+ * `update()` refuses it before any call.
+ */
+const DNS_MEMBER_REMOVAL: Throw = {
+  why: 'CloudFormation fails an update that removes a PrivateDnsNameOptions member ("No valid attributes specified", measured, go-to-k/cdkd#5630), so update() refuses it before any call (planPrivateDnsNameOptions)',
+  says: /was removed from the template, and CloudFormation fails that update \("No valid attributes specified"\)/,
+};
+const DNS_THROWS: Record<string, Throw> = {
+  'update-remove:PrivateDnsNameOptions': {
+    why: 'removing the whole PrivateDnsNameOptions block creates a new instance in CloudFormation (measured, go-to-k/cdkd#5630; instancePrivateDnsNameOptionsChangeReplaces), so a removal reaching update() is refused',
+    says: /CloudFormation creates a new instance when PrivateDnsNameOptions is removed/,
+  },
+  'update-remove:PrivateDnsNameOptions.HostnameType': DNS_MEMBER_REMOVAL,
+  'update-remove:PrivateDnsNameOptions.EnableResourceNameDnsARecord': DNS_MEMBER_REMOVAL,
+  'update-remove:PrivateDnsNameOptions.EnableResourceNameDnsAAAARecord': DNS_MEMBER_REMOVAL,
+};
+
 const INSTANCE_CASE: TypeCase = tc(
     'AWS::EC2::Instance',
     'i-1',
@@ -256,11 +306,28 @@ const INSTANCE_CASE: TypeCase = tc(
           CpuOptions: { CoreCount: 1, ThreadsPerCore: 1 },
           HibernationOptions: { Configured: true },
           InstanceInitiatedShutdownBehavior: 'terminate',
+          SourceDestCheck: false,
+          Tenancy: 'dedicated',
+          PlacementGroupName: 'pg-1',
+          PrivateIpAddress: '10.0.1.5',
+          PropagateTagsToVolumeOnCreation: true,
+          AdditionalInfo: 'reserved',
+          Ipv6AddressCount: 1,
+          PrivateDnsNameOptions: {
+            HostnameType: 'resource-name',
+            EnableResourceNameDnsARecord: true,
+            EnableResourceNameDnsAAAARecord: false,
+          },
         },
-        variants: { UserData: 'ZWNobyAy', InstanceInitiatedShutdownBehavior: 'stop' },
+        variants: {
+          UserData: 'ZWNobyAy',
+          InstanceInitiatedShutdownBehavior: 'stop',
+          SourceDestCheck: true,
+        },
         expectedRemovalThrows: {
           ...TAG_THROWS(ALL, 2),
           ...INSTANCE_THROWS,
+          ...DNS_THROWS,
           'update-remove:DisableApiTermination': {
             why: `CloudFormation fails an update that removes DisableApiTermination from an existing instance (measured, #1160), so update() refuses it before any call (guardTerminationProtectionRemoval, ${SRC}:8088-8093)`,
             says: /DisableApiTermination was removed from the template, and CloudFormation fails that update/,
@@ -274,13 +341,27 @@ const INSTANCE_CASE: TypeCase = tc(
           'update-remove:MetadataOptions': INSTANCE_KEPT('MetadataOptions'),
           'update-remove:CreditSpecification': INSTANCE_KEPT('CreditSpecification'),
           'update-remove:CreditSpecification.CPUCredits': INSTANCE_KEPT('CreditSpecification'),
+          ...PROPAGATE_SILENT,
+          ...ADDITIONAL_INFO_SILENT,
           ...BDM_REPLACES,
         },
       },
       {
         name: 'classic group names',
-        bag: { ImageId: 'ami-1', InstanceType: 't3.small', SecurityGroups: ['default', 'web'] },
-        expectedRemovalThrows: INSTANCE_THROWS,
+        bag: {
+          ImageId: 'ami-1',
+          InstanceType: 't3.small',
+          SecurityGroups: ['default', 'web'],
+          // go-to-k/cdkd#5630.
+          Ipv6Addresses: [{ Ipv6Address: '2001:db8::7' }],
+        },
+        expectedRemovalThrows: {
+          ...INSTANCE_THROWS,
+          'create:Ipv6Addresses.0.Ipv6Address': {
+            why: 'the schema requires Ipv6Address in each Ipv6Addresses entry; a launch without it would drop an address the template declared, so it is refused before RunInstances (go-to-k/cdkd#5630)',
+            says: /Ipv6Addresses\[0\]\.Ipv6Address is required/,
+          },
+        },
       },
       {
         name: 'network interfaces',
@@ -369,7 +450,9 @@ const INSTANCE_CASE: TypeCase = tc(
 // An EbsOptimized change is a replacement (replacement-rules.ts:1062-1083: it
 // is accepted only on a STOPPED instance), so the update probes skip it, as
 // the engine's replacement would.
-INSTANCE_CASE.createOnly = new Set([...INSTANCE_CASE.createOnly, 'EbsOptimized']);
+// A Tenancy change is a replacement too (replacement-rules.ts; CloudFormation
+// measured, go-to-k/cdkd#5630).
+INSTANCE_CASE.createOnly = new Set([...INSTANCE_CASE.createOnly, 'EbsOptimized', 'Tenancy']);
 
 export const CASES_16_EC2: TypeCase[] = [
   tc(
@@ -459,7 +542,12 @@ export const CASES_16_EC2: TypeCase[] = [
           CidrBlock: '10.0.1.0/24',
           AvailabilityZone: 'us-east-1a',
           MapPublicIpOnLaunch: true,
+          EnableDns64: true,
+          Ipv6CidrBlock: '2001:db8:1::/64',
           Tags: TAGS,
+        },
+        expectedSilent: {
+          'update-remove:EnableDns64': 'CloudFormation preserves the live DNS64 value on property removal (measured, go-to-k/cdkd#5632)',
         },
         expectedRemovalThrows: {
           ...TAG_THROWS(ALL, 2),
@@ -468,7 +556,41 @@ export const CASES_16_EC2: TypeCase[] = [
         },
       },
     ],
-    { targets: tagTargets() }
+    {
+      targets: tagTargets(),
+      arm: (_id, bag) => {
+        let ipv6 = bag['Ipv6CidrBlock'];
+        let dns64: unknown = bag['EnableDns64'] ?? false;
+        let mapPublicIp: unknown = bag['MapPublicIpOnLaunch'] ?? false;
+        const association = () => ({
+          AssociationId: 'subnet-cidr-assoc-1',
+          Ipv6CidrBlock: ipv6,
+          Ipv6CidrBlockState: { State: 'associated' },
+        });
+        setOutputOverrides({
+          CreateSubnetCommand: (input) => {
+            ipv6 = input['Ipv6CidrBlock'];
+            return { Subnet: { SubnetId: 'subnet-1', AvailabilityZone: 'us-east-1a', Ipv6CidrBlockAssociationSet: ipv6 === undefined ? [] : [association()] } };
+          },
+          DescribeSubnetsCommand: () => ({ Subnets: [{
+            SubnetId: 'subnet-1', MapPublicIpOnLaunch: mapPublicIp, EnableDns64: dns64,
+            Ipv6CidrBlockAssociationSet: ipv6 === undefined ? [] : [association()],
+          }] }),
+          ModifySubnetAttributeCommand: (input) => {
+            const dns = input['EnableDns64'] as { Value?: boolean } | undefined;
+            const pub = input['MapPublicIpOnLaunch'] as { Value?: boolean } | undefined;
+            if (dns !== undefined) dns64 = dns.Value;
+            if (pub !== undefined) mapPublicIp = pub.Value;
+            return {};
+          },
+          DisassociateSubnetCidrBlockCommand: () => { ipv6 = undefined; return {}; },
+          AssociateSubnetCidrBlockCommand: (input) => {
+            ipv6 = input['Ipv6CidrBlock'];
+            return { Ipv6CidrBlockAssociation: association() };
+          },
+        });
+      },
+    }
   ),
   tc(
     'AWS::EC2::InternetGateway',

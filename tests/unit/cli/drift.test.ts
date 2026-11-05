@@ -427,6 +427,207 @@ describe('cdkd drift', () => {
     expect(exitSpy).not.toHaveBeenCalled();
   });
 
+  describe('an undeclared bucket NotificationConfiguration (go-to-k/cdkd#5736, #5741)', () => {
+    // Live repro shape: the bucket's observed baseline was captured before any
+    // Custom::S3BucketNotifications ran, so it holds only the always-emitted
+    // EventBridgeConfiguration. The readback then carries the custom resource's
+    // QueueConfigurations. Not drift whichever stack the custom resource lives
+    // in: CFn compares declared properties only.
+    const queueConfig = {
+      QueueConfigurations: [
+        {
+          Id: 'n1',
+          Queue: 'arn:aws:sqs:us-east-1:123456789012:q',
+          Event: 's3:ObjectCreated:*',
+        },
+      ],
+      EventBridgeConfiguration: { EventBridgeEnabled: false },
+    };
+    const bucket = (properties: Record<string, unknown> = {}): ResourceState =>
+      makeResource({
+        physicalId: 'my-bucket',
+        resourceType: 'AWS::S3::Bucket',
+        properties,
+        observedProperties: {
+          BucketName: 'my-bucket',
+          NotificationConfiguration: { EventBridgeConfiguration: { EventBridgeEnabled: false } },
+          VersioningConfiguration: { Status: 'Enabled' },
+        },
+      });
+    const notifications = (bucketName: string): ResourceState =>
+      makeResource({
+        physicalId: 'notif-id',
+        resourceType: 'Custom::S3BucketNotifications',
+        properties: {
+          ServiceToken: 'arn:aws:lambda:us-east-1:123456789012:function:h',
+          BucketName: bucketName,
+          NotificationConfiguration: { QueueConfigurations: [] },
+          Managed: true,
+        },
+      });
+
+    it('does not report a same-stack custom resource configuration as drift (#5736)', async () => {
+      mockListStacks.mockResolvedValueOnce([{ stackName: 'TestStack', region: 'us-east-1' }]);
+      mockGetState.mockResolvedValueOnce(
+        makeState({ B: bucket(), BNotifications: notifications('my-bucket') })
+      );
+      mockRegistryGetProvider.mockReturnValue({
+        readCurrentState: async () => ({
+          BucketName: 'my-bucket',
+          NotificationConfiguration: queueConfig,
+          VersioningConfiguration: { Status: 'Enabled' },
+        }),
+      });
+
+      const { output, error } = await runDrift(['TestStack']);
+
+      expect(error).toBeUndefined();
+      expect(output).toContain('no drift detected');
+      expect(output).not.toContain('QueueConfigurations');
+      expect(exitSpy).not.toHaveBeenCalled();
+    });
+
+    it('does not report it when no custom resource in the stack targets the bucket (#5741)', async () => {
+      // The cross-stack `Bucket.fromBucketName(...).addEventNotification(...)`
+      // shape: the writer lives in another stack's state (or none cdkd can
+      // see), so the bucket's stack holds no custom resource naming it.
+      mockListStacks.mockResolvedValueOnce([{ stackName: 'TestStack', region: 'us-east-1' }]);
+      mockGetState.mockResolvedValueOnce(makeState({ B: bucket() }));
+      mockRegistryGetProvider.mockReturnValue({
+        readCurrentState: async () => ({
+          BucketName: 'my-bucket',
+          NotificationConfiguration: queueConfig,
+          VersioningConfiguration: { Status: 'Enabled' },
+        }),
+      });
+
+      const { output, error } = await runDrift(['TestStack']);
+
+      expect(error).toBeUndefined();
+      expect(output).toContain('no drift detected');
+      expect(output).not.toContain('QueueConfigurations');
+      expect(exitSpy).not.toHaveBeenCalled();
+    });
+
+    it('still reports another drifted key on that bucket', async () => {
+      // The control for the test above: the skip is the one key, not the
+      // bucket, so the same readback with versioning changed is drift.
+      mockListStacks.mockResolvedValueOnce([{ stackName: 'TestStack', region: 'us-east-1' }]);
+      mockGetState.mockResolvedValueOnce(makeState({ B: bucket() }));
+      mockRegistryGetProvider.mockReturnValue({
+        readCurrentState: async () => ({
+          BucketName: 'my-bucket',
+          NotificationConfiguration: queueConfig,
+          VersioningConfiguration: { Status: 'Suspended' },
+        }),
+      });
+
+      const { output } = await runDrift(['TestStack']);
+
+      expect(output).toContain('VersioningConfiguration.Status');
+      expect(output).not.toContain('QueueConfigurations');
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+
+    it('still compares a NotificationConfiguration the bucket itself declares', async () => {
+      // A template-declared value is compared, as CloudFormation would.
+      mockListStacks.mockResolvedValueOnce([{ stackName: 'TestStack', region: 'us-east-1' }]);
+      mockGetState.mockResolvedValueOnce(
+        makeState({
+          B: bucket({ NotificationConfiguration: { EventBridgeConfiguration: {} } }),
+          BNotifications: notifications('my-bucket'),
+        })
+      );
+      mockRegistryGetProvider.mockReturnValue({
+        readCurrentState: async () => ({
+          BucketName: 'my-bucket',
+          NotificationConfiguration: queueConfig,
+          VersioningConfiguration: { Status: 'Enabled' },
+        }),
+      });
+
+      const { output } = await runDrift(['TestStack']);
+
+      expect(output).toContain('NotificationConfiguration.QueueConfigurations');
+      expect(exitSpy).toHaveBeenCalledWith(1);
+    });
+
+    it('--accept of another drifted key does not persist the live notifications (#5741)', async () => {
+      // --accept writes from the detected changes, so the skipped key must not
+      // reach the saved baseline either.
+      mockListStacks.mockResolvedValueOnce([{ stackName: 'TestStack', region: 'us-east-1' }]);
+      mockGetState.mockResolvedValueOnce(makeState({ B: bucket() }));
+      mockRegistryGetProvider.mockReturnValue({
+        readCurrentState: async () => ({
+          BucketName: 'my-bucket',
+          NotificationConfiguration: queueConfig,
+          VersioningConfiguration: { Status: 'Suspended' },
+        }),
+      });
+
+      await runDrift(['TestStack', '--accept', '--yes']);
+
+      expect(mockSaveState).toHaveBeenCalledTimes(1);
+      const [, , savedState] = mockSaveState.mock.calls[0]!;
+      const observed = (
+        savedState as {
+          resources: Record<string, { observedProperties?: Record<string, unknown> }>;
+        }
+      ).resources['B']?.observedProperties;
+      expect(observed?.['VersioningConfiguration']).toEqual({ Status: 'Suspended' });
+      expect(observed?.['NotificationConfiguration']).toEqual({
+        EventBridgeConfiguration: { EventBridgeEnabled: false },
+      });
+    });
+
+    it.each([
+      ['a same-stack custom resource (#5736)', true],
+      ['no custom resource in the stack (#5741)', false],
+    ])(
+      '--revert of another drifted key sends the live notifications back unchanged: %s',
+      async (_label, withCustomResource) => {
+        // The destructive half of both issues: the revert must never write the
+        // baseline's empty NotificationConfiguration over the live one, which
+        // would delete the other writer's notifications.
+        mockListStacks.mockResolvedValueOnce([{ stackName: 'TestStack', region: 'us-east-1' }]);
+        mockGetState.mockResolvedValueOnce(
+          makeState(
+            withCustomResource
+              ? { B: bucket(), BNotifications: notifications('my-bucket') }
+              : { B: bucket() }
+          )
+        );
+        const updateMock = vi.fn<
+          (
+            logicalId: string,
+            physicalId: string,
+            resourceType: string,
+            newProperties: Record<string, unknown>,
+            previousProperties: Record<string, unknown>
+          ) => Promise<{ physicalId: string; wasReplaced: boolean }>
+        >(async () => ({ physicalId: 'my-bucket', wasReplaced: false }));
+        mockRegistryGetProvider.mockReturnValue({
+          readCurrentState: async () => ({
+            BucketName: 'my-bucket',
+            NotificationConfiguration: queueConfig,
+            VersioningConfiguration: { Status: 'Suspended' },
+          }),
+          update: updateMock,
+        });
+
+        const { error } = await runDrift(['TestStack', '--revert', '--yes']);
+
+        expect(error).toBeUndefined();
+        expect(updateMock).toHaveBeenCalledTimes(1);
+        const [logicalId, , , newProps, previousProps] = updateMock.mock.calls[0]!;
+        expect(logicalId).toBe('B');
+        expect(newProps['VersioningConfiguration']).toEqual({ Status: 'Enabled' });
+        expect(newProps['NotificationConfiguration']).toEqual(queueConfig);
+        expect(previousProps['NotificationConfiguration']).toEqual(queueConfig);
+      }
+    );
+  });
+
   it('still reports drift on an undeclared key captured with a REAL value that later changed', async () => {
     // The observed baseline's extra power over CFn drift stays: an AWS-side
     // default captured with a real value at deploy time IS compared, so a

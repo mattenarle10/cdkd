@@ -107,12 +107,16 @@ mean what they mean on that command, and that page explains them:
 | `--image-build-arg <KEY=VAL...>` | — | `docker build --build-arg` for override builds. |
 | `--image-build-secret <id=src...>` | — | `docker build --secret` for override builds. |
 | `--image-target <stage or svc=stage...>` | — | `docker build --target` for override builds. |
+| `--image-context <dir or svc=dir...>` | the Dockerfile's directory | `docker build` context for override builds. |
 | `--no-interactive-overrides` | off | Do not prompt for Dockerfiles at startup. |
 | `--strict-overrides` | off | Refuse to start while a service still runs a deployed image. |
 
 `--shadow-ready-timeout` can also be set with the
 `CDKD_SHADOW_READY_TIMEOUT_MS` environment variable, and the flag wins when
-both are set. `--assume-task-role` is a deprecated alias of `--assume-role`.
+both are set. `--assume-task-role` is a deprecated alias of `--assume-role`;
+how it reaches the containers, and why every service must resolve to the same
+task role, is described under
+[start-service's network](local-start-service.md#the-network-and-its-helper-container).
 The override flags are explained in
 [Image overrides for local ECS services](local-start-service-image-overrides.md).
 
@@ -161,6 +165,16 @@ of the load balancer.
 | Actions | `forward`, `redirect`, `fixed-response` |
 | Authentication actions | `authenticate-cognito`, `authenticate-oidc` |
 | Target groups | ECS services, Lambda functions |
+
+Condition values must be literal strings, with one exception: a `host-header`
+value naming the load balancer's own DNS name
+(`ListenerCondition.hostHeaders([alb.loadBalancerDnsName])`) matches any
+`Host`, because every request that reaches the local front door is addressed
+to it. On AWS a request by IP misses that rule and gets the default action;
+locally it matches. Any other value cdkd cannot resolve locally (a `Ref` to a
+parameter, another load balancer's DNS name, `Fn::Join`, `Fn::ImportValue`,
+a `Fn::Split` value list)
+skips the whole rule with a warning.
 
 A `forward` action can send to one target group or split requests across
 several by weight. `TCP`, `UDP` and `TLS` listeners belong to Network Load

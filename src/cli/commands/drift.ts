@@ -196,6 +196,7 @@ import {
   secretNamePrintingBags,
 } from '../../deployment/secret-name-needles.js';
 import { withPrintingSecrets } from '../../deployment/resource-secrets-scope.js';
+import { coerceCfnBoolean } from '../../provisioning/config-shape.js';
 
 /**
  * Why cdkd did not compare every property a resource records.
@@ -3338,6 +3339,109 @@ function redactDriftChanges(
 }
 
 /**
+ * Per resource type, the top-level keys drift never compares unless the
+ * template declares them on the resource (go-to-k/cdkd#5736, #5741).
+ *
+ * `AWS::S3::Bucket` `NotificationConfiguration`: CDK's
+ * `bucket.addEventNotification(...)` (and `eventBridgeEnabled`) does not declare
+ * it on the bucket. A `Custom::S3BucketNotifications` resource calls
+ * `PutBucketNotificationConfiguration` after the bucket settles, and that
+ * custom resource can live in ANOTHER stack (`Bucket.fromBucketName(...)
+ * .addEventNotification(...)`, `Managed: false`), in a stack cdkd does not
+ * manage, or be any other tool. The bucket's observed baseline is captured
+ * before any of them runs and still holds a non-empty value
+ * (`readNotification` always emits `EventBridgeConfiguration`), so
+ * {@link undeclaredEmptyObservedKeys} does not skip it.
+ */
+const UNDECLARED_UNCOMPARED_KEYS: Readonly<Record<string, readonly string[]>> = {
+  'AWS::S3::Bucket': ['NotificationConfiguration'],
+};
+
+/**
+ * The top-level keys drift must NOT compare on one resource: its type's
+ * {@link UNDECLARED_UNCOMPARED_KEYS} entries that its state `properties` (the
+ * template) does not declare (go-to-k/cdkd#5741).
+ *
+ * WHY: comparing them reported another writer's configuration as drift, and
+ * `drift --revert` wrote the baseline back and DELETED that writer's live
+ * configuration. Scanning the state for the writing custom resource (#5736's
+ * first rule, same stack only) cannot see every writer — another stack's state,
+ * a CloudFormation-deployed stack, a non-CDK tool — and each one it misses is a
+ * deletion path. CloudFormation drift compares only the properties the
+ * template declares, so it reports nothing here either. A key the template DOES
+ * declare is still compared, as it would be in CloudFormation.
+ *
+ * The rule reads only state, so a stack deployed with the old baseline is fixed
+ * without a redeploy, and `--revert` / `--accept` never act on the key: both
+ * work from the detected changes. It applies to an SDK-provisioned and a Cloud
+ * Control-provisioned record alike. A record whose `properties` is not a plain
+ * object gets no skip.
+ */
+export function undeclaredUncomparedDriftKeys(resourceType: string, properties: unknown): string[] {
+  const keys = hasOwnKey(UNDECLARED_UNCOMPARED_KEYS, resourceType)
+    ? UNDECLARED_UNCOMPARED_KEYS[resourceType]!
+    : [];
+  if (keys.length === 0) return [];
+  if (typeof properties !== 'object' || properties === null || Array.isArray(properties)) {
+    return [];
+  }
+  return keys.filter((key) => !hasOwnKey(properties as Record<string, unknown>, key));
+}
+
+/**
+ * The top-level keys drift must NOT compare on one resource because its
+ * observed baseline holds a value an earlier cdkd recorded by mistake
+ * (go-to-k/cdkd#5749). Today one rule: an `AWS::Lambda::EventSourceMapping`
+ * whose baseline holds `Enabled: false` while the template does not declare
+ * `Enabled: false` and the live mapping reads `Enabled: true`.
+ *
+ * WHY: before #5737 the post-create baseline was read while the mapping was
+ * still `Creating` and recorded `Enabled: false` for every mapping the
+ * template leaves enabled. A no-change deploy never re-reads it, so on such a
+ * stack `cdkd drift` reported `Enabled: false -> true` and `--revert` sent
+ * `Enabled: false`, stopping the consumer. CloudFormation compares the live
+ * value with the template (absent means `true`), so it reports nothing here.
+ *
+ * Read with {@link coerceCfnBoolean}, the reading the provider's
+ * `enabledFromState` gives the template value. A template declaring
+ * `Enabled: false` keeps the normal comparison, as does a live mapping that
+ * reads disabled, so a disable cdkd did not make is still reported against a
+ * `true` baseline. What the rule cannot tell apart: a disable that was
+ * accepted into the baseline and then re-enabled outside cdkd. Re-enabling
+ * against the template's own default is not reported, which is what
+ * CloudFormation would say too. A live `true` also comes from a mapping still
+ * `Creating` / `Updating` under such a template (`enabledFromState` answers
+ * the template's value there); skipping the key then is no loss, since the
+ * comparison would have reported the same stale `false -> true`.
+ *
+ * Read-only and per resource: nothing is written to state. `--revert` and
+ * `--accept` act only on detected changes, so neither touches the key. The
+ * baseline is rewritten by the next update deploy of the mapping or by
+ * `cdkd state refresh-observed`. Only the observed baseline can carry the
+ * artifact; the `properties` fallback is the template itself.
+ */
+export function preFixBaselineUncomparedDriftKeys(
+  resourceType: string,
+  observed: Record<string, unknown> | undefined,
+  properties: unknown,
+  aws: Record<string, unknown>
+): string[] {
+  if (resourceType !== 'AWS::Lambda::EventSourceMapping') return [];
+  if (observed === undefined) return [];
+  if (typeof properties !== 'object' || properties === null || Array.isArray(properties)) {
+    return [];
+  }
+  const declared = hasOwnKey(properties as Record<string, unknown>, 'Enabled')
+    ? coerceCfnBoolean((properties as Record<string, unknown>)['Enabled'])
+    : undefined;
+  const recorded = hasOwnKey(observed, 'Enabled')
+    ? coerceCfnBoolean(observed['Enabled'])
+    : undefined;
+  const live = hasOwnKey(aws, 'Enabled') ? aws['Enabled'] : undefined;
+  return recorded === false && declared !== false && live === true ? ['Enabled'] : [];
+}
+
+/**
  * Run drift detection for one stack and shape the per-resource outcomes
  * into a {@link StackDriftReport}. The state object + etag are stored on
  * the report so `--accept` can write back without a re-read, and
@@ -4194,10 +4298,32 @@ async function runDriftForStack(
                 driftAbsentMeansDefaultKeys(provider, resource.resourceType, resource.properties)
               )
             : nameBaseline;
+          // go-to-k/cdkd#5736 / #5741: an undeclared key another writer owns
+          // (a bucket's NotificationConfiguration) is not compared, whichever
+          // baseline is in use.
+          const ownedIgnorePaths = undeclaredUncomparedDriftKeys(
+            resource.resourceType,
+            resource.properties
+          );
+          // go-to-k/cdkd#5749: a baseline value a pre-#5737 cdkd recorded by
+          // mistake (an event source mapping's `Enabled: false`) is not
+          // compared while the template and the live mapping agree on enabled.
+          const preFixIgnorePaths = preFixBaselineUncomparedDriftKeys(
+            resource.resourceType,
+            resource.observedProperties,
+            resource.properties,
+            aws
+          );
           const changes = calculateResourceDrift(comparedBaseline, paired.aws, {
-            ignorePaths: observedIgnorePaths.length
-              ? [...ignorePaths, ...observedIgnorePaths]
-              : ignorePaths,
+            ignorePaths:
+              observedIgnorePaths.length || ownedIgnorePaths.length || preFixIgnorePaths.length
+                ? [
+                    ...ignorePaths,
+                    ...observedIgnorePaths,
+                    ...ownedIgnorePaths,
+                    ...preFixIgnorePaths,
+                  ]
+                : ignorePaths,
             unionWalkObjects: useObserved,
             unorderedPaths,
           });

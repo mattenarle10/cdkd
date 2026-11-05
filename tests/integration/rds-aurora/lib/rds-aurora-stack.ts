@@ -178,6 +178,24 @@ export class RdsAuroraStack extends cdk.Stack {
       ],
     });
 
+    // go-to-k/cdkd#5639: the SecurityCluster's AssociatedRoles. Phase 1
+    // attaches the import role for `s3Import`; phases 1b / 1c (keyed on
+    // CDKD_TEST_TG_TAGS, set only there) swap it for the export role for
+    // `s3Export`, so the update both detaches and attaches; phase 2 DROPS the
+    // property, which detaches the export role, as CloudFormation's handler
+    // removes the previous roles the desired list lacks. Before
+    // #5639 the declared list routed the SecurityCluster to Cloud Control (the
+    // provisionedBy=sdk guard in verify.sh catches it); verify.sh asserts the
+    // live associations after each phase. Both roles exist in every phase, so
+    // only the association changes. RDS assumes neither here: an association
+    // needs only the trust policy.
+    const s3ImportRole = new iam.Role(this, 'SecurityS3ImportRole', {
+      assumedBy: new iam.ServicePrincipal('rds.amazonaws.com'),
+    });
+    const s3ExportRole = new iam.Role(this, 'SecurityS3ExportRole', {
+      assumedBy: new iam.ServicePrincipal('rds.amazonaws.com'),
+    });
+
     // Aurora PostgreSQL Serverless v2 cluster — NO cluster instance: the
     // cluster-level create accepts and reflects every security prop, and
     // skipping the instance keeps the fixture cheap. Each #609 security prop
@@ -296,17 +314,41 @@ export class RdsAuroraStack extends cdk.Stack {
       //   * AutoMinorVersionUpgrade: false in phase 1 (AWS default true),
       //     true in phase 2, so ModifyDBCluster must send the change.
       //   * PerformanceInsightsEnabled true in both phases; the retention is
-      //     7 days in phase 1 and 31 in phase 2, which sends the trio.
+      //     7 days in phase 1 and 465 in phase 2 (beside DatabaseInsightsMode
+      //     advanced), which sends the trio.
       //   * NetworkType IPV4 in both phases (DUAL needs IPv6 subnets): only
       //     the routing guard discriminates it.
       //   * EnableHttpEndpoint true in phase 1 (rides CreateDBCluster) and
       //     DROPPED in phase 2, which turns the Data API off
       //     (DisableHttpEndpoint), as CloudFormation's handler does.
+      // go-to-k/cdkd#5639: phase 2 also switches DatabaseInsightsMode from
+      // `standard` to `advanced`, which needs the 465-day retention beside it
+      // (measured accepted on a cluster with no instance).
       autoMinorVersionUpgrade: isUpdate,
       performanceInsightsEnabled: true,
-      performanceInsightsRetentionPeriod: isUpdate ? 31 : 7,
+      performanceInsightsRetentionPeriod: isUpdate ? 465 : 7,
       networkType: 'IPV4',
       ...(isUpdate ? {} : { enableHttpEndpoint: true }),
+      databaseInsightsMode: isUpdate ? 'advanced' : 'standard',
+      // go-to-k/cdkd#5639, unchanged in both phases: before #5639 it routed
+      // the SecurityCluster to Cloud Control (the provisionedBy=sdk guard
+      // catches it), and verify.sh asserts it live; a change is refused, as
+      // CloudFormation refuses it. MasterUserAuthenticationType is NOT declared
+      // here: CreateDBCluster refuses ANY declared type beside the Data API
+      // (EnableHttpEndpoint, phase 1), `password` included ("The master user
+      // authentication type 'iam-db-auth' isn't supported with Data API"),
+      // and CloudFormation fails the same template the same way (measured
+      // us-east-1, 2026-11-04). The EngineCluster below carries it.
+      engineLifecycleSupport: 'open-source-rds-extended-support-disabled',
+      ...(isUpdate
+        ? {}
+        : {
+            associatedRoles: [
+              process.env.CDKD_TEST_TG_TAGS
+                ? { roleArn: s3ExportRole.roleArn, featureName: 's3Export' }
+                : { roleArn: s3ImportRole.roleArn, featureName: 's3Import' },
+            ],
+          }),
     });
     // Issue #1160: once phase 2 drops the Ref, this keeps the security group
     // deleted AFTER the cluster that may still hold it.
@@ -324,6 +366,33 @@ export class RdsAuroraStack extends cdk.Stack {
       engine: process.env.CDKD_TEST_ENGINE_SWAP === 'true' ? 'aurora-postgresql' : 'aurora-mysql',
       masterUsername: 'cdkdadmin',
       manageMasterUserPassword: true,
+      // go-to-k/cdkd#5639: carries the DBCluster MasterUserAuthenticationType
+      // routing check (verify.sh), since the SecurityCluster's Data API rules
+      // it out there. `password` beside the managed password is accepted on
+      // create (measured), and no Data API is declared here.
+      masterUserAuthenticationType: 'password',
+      // go-to-k/cdkd#5639: before #5639 each routed the EngineCluster to Cloud
+      // Control (the provisionedBy=sdk guard in verify.sh catches it).
+      //   * ClusterScalabilityType `standard` in every phase (create-only).
+      //     `standard` is AWS's default, so only the routing guard
+      //     discriminates it (as NetworkType IPV4 on the SecurityCluster).
+      //   * BacktrackWindow 3600 in phase 1, 7200 in phases 1b / 1c (keyed on
+      //     CDKD_TEST_TG_TAGS, set only there), so ModifyDBCluster must send
+      //     the change; DROPPED in phase 2, where the live window is kept.
+      //   * EnableLocalWriteForwarding true in phases 1-1c, DROPPED in phase
+      //     2, which turns forwarding off, as CloudFormation's handler does
+      //     (`Translator.modifyDbClusterRequest`). That disable also proves
+      //     phase 2's ModifyDBCluster reached this cluster, so the kept
+      //     BacktrackWindow assertion cannot pass vacuously.
+      // Both are aurora-mysql features; phase 2c's Engine swap is an update
+      // phase, so neither is declared there.
+      clusterScalabilityType: 'standard',
+      ...(isUpdate
+        ? {}
+        : {
+            backtrackWindow: process.env.CDKD_TEST_TG_TAGS ? 7200 : 3600,
+            enableLocalWriteForwarding: true,
+          }),
       backupRetentionPeriod: 1,
       dbSubnetGroupName: securitySubnetGroup.subnetGroupName,
       serverlessV2ScalingConfiguration: { minCapacity: 0, maxCapacity: 1 },

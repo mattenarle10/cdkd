@@ -1068,6 +1068,11 @@
       "scenarios": []
     },
     {
+      "name": "ec2-subnet-dns64",
+      "annotated": false,
+      "scenarios": []
+    },
+    {
       "name": "ec2-vpc",
       "annotated": true,
       "scenarios": []
@@ -1316,6 +1321,11 @@
     },
     {
       "name": "globaltable-fix-forward-orphan",
+      "annotated": false,
+      "scenarios": []
+    },
+    {
+      "name": "globaltable-template-baseline-drift",
       "annotated": false,
       "scenarios": []
     },
@@ -3631,6 +3641,7 @@
     "ec2-instance-fanout",
     "ec2-route-targets",
     "ec2-sg-source-group-name",
+    "ec2-subnet-dns64",
     "ec2-vpc-ipam",
     "ecr-scanning",
     "ecs-gateway-role-propagation",
@@ -3653,6 +3664,7 @@
     "generated-name-security-group",
     "getatt-fallback-guard",
     "globaltable-fix-forward-orphan",
+    "globaltable-template-baseline-drift",
     "glue-securityconfig-replace",
     "guardduty-detector-update",
     "healthimaging-stateful-update-fallback",

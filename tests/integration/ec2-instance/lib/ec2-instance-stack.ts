@@ -41,6 +41,28 @@ import * as kms from 'aws-cdk-lib/aws-kms';
  * Issue #5630 also gives the NetworkInterfaces-shaped instance CpuOptions and
  * HibernationOptions (with the encrypted root volume hibernation needs).
  *
+ * Issue #5630 (second slice): the main instance launches with
+ * SourceDestCheck=false (a ModifyInstanceAttribute after RunInstances, which
+ * Phase 0 sends while the instance is still `pending`), a fixed
+ * PrivateIpAddress, a spread PlacementGroupName and an explicit
+ * Tenancy=default; Phase 1h REMOVES SourceDestCheck, which CloudFormation sets
+ * back to true in place (measured, us-east-1). The NetworkInterfaces-shaped
+ * instance sets PropagateTagsToVolumeOnCreation with a tag, which both of its
+ * volumes must carry.
+ *
+ * Issue #5630 (third slice): the main instance declares PrivateDnsNameOptions
+ * (resource-name hostnames with their A record); Phase 1h changes HostnameType
+ * to ip-name and turns the A record off. CloudFormation applies both to the
+ * SAME instance (measured: the flag in place, the hostname type with a stop and
+ * a start, which Phase 1h's InstanceType change shares), and the private DNS
+ * name moves with it, which the Phase 1g PrivateDnsName reader must follow.
+ * Phase 1i (CDKD_TEST_DNS_5630=flag) then turns the A record on alone, in
+ * place with no stop, and Phase 1j (=hostname) changes only HostnameType back
+ * to resource-name, which takes a stop and a start on its own. A
+ * third and fourth instance launch in an IPv6 subnet (an Amazon-provided /56 on
+ * the VPC, the subnet its first /64) with Ipv6AddressCount and with a fixed
+ * Ipv6Addresses entry (`<the /64>::77`), both create-only RunInstances inputs.
+ *
  * REMOVAL phases (issue #1160; CloudFormation A/B in go-to-k/cdkd#1160
  * issuecomment-6281778130). CDKD_TEST_REMOVAL=true drops MetadataOptions /
  * Monitoring / CreditSpecification: CloudFormation turns a removed Monitoring
@@ -65,6 +87,10 @@ export class Ec2InstanceStack extends cdk.Stack {
     // has no address to give it), so Phase 1h's stop/start has to PROMOTE it.
     const withIpReader = process.env.CDKD_TEST_IP_READER === 'true';
     const datMode = process.env.CDKD_TEST_DAT;
+    // Issue #5630 (verify.sh Phases 1i-1j, after Phase 1h): `flag` turns the
+    // A record on alone (in place, no stop); `hostname` then changes only
+    // HostnameType back to resource-name (a stop and a start).
+    const dnsMode = process.env.CDKD_TEST_DNS_5630;
 
     // Create VPC with 1 AZ and no NAT gateways (cost saving)
     const vpc = new ec2.Vpc(this, 'Vpc', {
@@ -100,6 +126,11 @@ export class Ec2InstanceStack extends cdk.Stack {
       allowAllOutbound: true,
     });
 
+    // Issue #5630: a spread placement group (t3 supports spread, not cluster).
+    const placementGroup = new ec2.CfnPlacementGroup(this, 'PlacementGroup5630', {
+      strategy: 'spread',
+    });
+
     // Resolve the Amazon Linux 2023 AMI for this stack's region.
     const ami = ec2.MachineImage.latestAmazonLinux2023().getImage(this).imageId;
 
@@ -122,6 +153,27 @@ export class Ec2InstanceStack extends cdk.Stack {
       // CloudFormation does with no interruption (measured, us-east-1). It
       // stays declared in every phase: CloudFormation fails a removal.
       instanceInitiatedShutdownBehavior: isUpdate5446 ? 'stop' : 'terminate',
+      // Issue #5630 (second slice). SourceDestCheck=false is the non-default
+      // value; Phase 1h removes it, which CloudFormation resets to true in
+      // place. PrivateIpAddress / PlacementGroupName / Tenancy are replacing
+      // properties, so they stay identical in every phase. The address sits in
+      // the public subnet (10.0.0.0/24, the first /24 of the VPC's default
+      // 10.0.0.0/16). Tenancy=default proves only the SDK route: a dedicated
+      // instance carries an hourly region fee, and the wire is unit-tested.
+      ...(isUpdate5446 ? {} : { sourceDestCheck: false }),
+      privateIpAddress: '10.0.0.200',
+      placementGroupName: placementGroup.ref,
+      tenancy: 'default',
+      // Issue #5630 (third slice): both members stay declared in every phase
+      // (CloudFormation fails an update removing one). No AAAA flag: the
+      // subnet is IPv4-only.
+      privateDnsNameOptions: !isUpdate5446
+        ? { hostnameType: 'resource-name', enableResourceNameDnsARecord: true }
+        : dnsMode === 'hostname'
+          ? { hostnameType: 'resource-name', enableResourceNameDnsARecord: true }
+          : dnsMode === 'flag'
+            ? { hostnameType: 'ip-name', enableResourceNameDnsARecord: true }
+            : { hostnameType: 'ip-name', enableResourceNameDnsARecord: false },
       // Security-focused property backfill (#609):
       // Termination protection — a silent-drop here would let a user believe
       // the instance is protected when it is not. `cdkd destroy
@@ -175,6 +227,17 @@ export class Ec2InstanceStack extends cdk.Stack {
         value: ipReader.ref,
         description: 'The SSM parameter reading the instance public IP (issue #5446)',
       });
+      // Issue #5630: Phase 1h's HostnameType change moves the private DNS
+      // name in place, so this reader must be promoted and follow it.
+      const dnsReader = new ssm.CfnParameter(this, 'PrivateDnsNameReader5630', {
+        type: 'String',
+        value: instance.attrPrivateDnsName,
+        description: 'cdkd ec2-instance integ (issue #5630): reads Fn::GetAtt Instance.PrivateDnsName',
+      });
+      new cdk.CfnOutput(this, 'DnsReaderParamName', {
+        value: dnsReader.ref,
+        description: 'The SSM parameter reading the instance private DNS name (issue #5630)',
+      });
     }
 
     new cdk.CfnOutput(this, 'PrivateIp', {
@@ -227,6 +290,9 @@ export class Ec2InstanceStack extends cdk.Stack {
       // exact shape (measured, us-east-1, t3.nano + AL2023).
       cpuOptions: { coreCount: 1, threadsPerCore: 1 },
       hibernationOptions: { configured: true },
+      // Issue #5630: both block-device volumes must carry this tag.
+      propagateTagsToVolumeOnCreation: true,
+      tags: [{ key: 'Cdkd5630Propagate', value: 'volume-tag' }],
       blockDeviceMappings: [
         {
           deviceName: '/dev/xvda',
@@ -255,9 +321,68 @@ export class Ec2InstanceStack extends cdk.Stack {
       ],
     });
 
+    // Issue #5630: the main instance claims the fixed 10.0.0.200 in the same
+    // /24 this instance takes an auto-assigned address from, so launch it
+    // first; otherwise this one could be handed .200 and the main launch fail.
+    publicInstance.addDependency(instance);
+
     new cdk.CfnOutput(this, 'PublicInstanceId', {
       value: publicInstance.ref,
       description: 'NetworkInterfaces-shaped EC2 Instance ID (issue #1281)',
+    });
+
+    new cdk.CfnOutput(this, 'PlacementGroupName', {
+      value: placementGroup.ref,
+      description: 'The spread placement group the main instance launches in (issue #5630)',
+    });
+
+    // Issue #5630 (third slice): an Amazon-provided IPv6 /56 on the VPC and a
+    // subnet holding its first /64 (Fn::Cidr). The fixed address is that /64's
+    // first four hextets plus `::77`; they are read off the Fn::Cidr result,
+    // which cdkd writes uncompressed, so a zero fourth hextet still yields four
+    // fields (the /56 AWS reports would compress it away). Nothing routes out
+    // of the subnet: the instances only need their addresses.
+    const ipv6Block = new ec2.CfnVPCCidrBlock(this, 'Ipv6Block5630', {
+      vpcId: vpc.vpcId,
+      amazonProvidedIpv6CidrBlock: true,
+    });
+    const v6Subnet64 = cdk.Fn.select(
+      0,
+      cdk.Fn.cidr(cdk.Fn.select(0, vpc.vpcIpv6CidrBlocks), 1, '64')
+    );
+    const v6Hextets = cdk.Fn.split(':', v6Subnet64);
+    const v6Prefix = cdk.Fn.join(':', [0, 1, 2, 3].map((i) => cdk.Fn.select(i, v6Hextets)));
+    const ipv6Subnet = new ec2.CfnSubnet(this, 'Ipv6Subnet5630', {
+      vpcId: vpc.vpcId,
+      availabilityZone: vpc.publicSubnets[0].availabilityZone,
+      cidrBlock: '10.0.255.0/24',
+      ipv6CidrBlock: v6Subnet64,
+    });
+    ipv6Subnet.addDependency(ipv6Block);
+    const ipv6Address = cdk.Fn.join('', [v6Prefix, '::77']);
+    const ipv6CountInstance = new ec2.CfnInstance(this, 'Ipv6CountInstance5630', {
+      imageId: ami,
+      instanceType: 't3.nano',
+      subnetId: ipv6Subnet.ref,
+      ipv6AddressCount: 1,
+    });
+    const ipv6AddressInstance = new ec2.CfnInstance(this, 'Ipv6AddressInstance5630', {
+      imageId: ami,
+      instanceType: 't3.nano',
+      subnetId: ipv6Subnet.ref,
+      ipv6Addresses: [{ ipv6Address: ipv6Address }],
+    });
+    new cdk.CfnOutput(this, 'Ipv6CountInstanceId', {
+      value: ipv6CountInstance.ref,
+      description: 'The instance launched with Ipv6AddressCount 1 (issue #5630)',
+    });
+    new cdk.CfnOutput(this, 'Ipv6AddressInstanceId', {
+      value: ipv6AddressInstance.ref,
+      description: 'The instance launched with a fixed Ipv6Addresses entry (issue #5630)',
+    });
+    new cdk.CfnOutput(this, 'Ipv6AddressExpected', {
+      value: ipv6Address,
+      description: 'The address Ipv6AddressInstance5630 must hold (issue #5630)',
     });
 
     new cdk.CfnOutput(this, 'EbsKeyArn', {

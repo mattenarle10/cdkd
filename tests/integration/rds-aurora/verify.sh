@@ -103,16 +103,33 @@
 # and disables in one call (asserted live). Cleanup deletes the CloudWatch log
 # groups RDS created for the exports.
 #
+# go-to-k/cdkd#5639 (DBCluster AssociatedRoles): the SecurityCluster attaches
+# an import role for `s3Import` in phase 1 (asserted live; before #5639 the
+# provisionedBy=sdk guard fails), swaps it for an export role for `s3Export`
+# in phase 1b, which detaches one and attaches the other, and drops the
+# property in phase 2, which detaches the export role (each asserted live).
+# Both roles are stack resources in every phase.
+#
 # go-to-k/cdkd#5639 (DBCluster scalars): phase 1 declares
 # AutoMinorVersionUpgrade false, Performance Insights on with 7-day retention,
 # NetworkType IPV4 and EnableHttpEndpoint true (each asserted live; before
 # #5639 the provisionedBy=sdk guard fails). Phase 2 flips
-# AutoMinorVersionUpgrade to true, raises the retention to 31 days and DROPS
-# EnableHttpEndpoint, which turns the Data API off as CloudFormation does
-# (each asserted live). NetworkType IPV4 is AWS's default: only the routing
-# guard discriminates it.
+# AutoMinorVersionUpgrade to true, raises the retention to 465 days with
+# DatabaseInsightsMode `standard` -> `advanced`, and DROPS EnableHttpEndpoint,
+# which turns the Data API off as CloudFormation does (each asserted live).
+# NetworkType IPV4 is AWS's default: only the routing guard discriminates it.
+# EngineLifecycleSupport (Extended Support disabled, asserted live) stays
+# unchanged.
 # go-to-k/cdkd#5707: phase 1a turns that declared Data API off out of band
 # and asserts `cdkd drift --revert` turns it back on and converges.
+#
+# go-to-k/cdkd#5639 (DBCluster BacktrackWindow, EnableLocalWriteForwarding,
+# ClusterScalabilityType): the EngineCluster (aurora-mysql) declares
+# ClusterScalabilityType standard in every phase, BacktrackWindow 3600 and
+# write forwarding on in phase 1 (asserted live; before #5639 its
+# provisionedBy=sdk check fails), BacktrackWindow 7200 in phases 1b / 1c
+# (asserted live), and DROPS both in phase 2: the live window stays 7200 and
+# forwarding turns off, as CloudFormation's handler does (both asserted live).
 #
 # The SecurityCluster is also asserted to carry `provisionedBy=sdk` in cdkd
 # state — a routing guard proving none of the set props flipped the resource
@@ -543,6 +560,46 @@ if [ "${CLUSTER_PROVISIONED_BY}" != "sdk" ]; then
 fi
 echo "    OK: SecurityCluster provisionedBy=sdk (no SDK-unwired CC-API flip)"
 
+# go-to-k/cdkd#5639: the EngineCluster declares MasterUserAuthenticationType
+# `password` (the SecurityCluster cannot: CreateDBCluster refuses any declared
+# type beside its Data API). Before #5639 the property routed the cluster to
+# Cloud Control; it is write-only (no Describe field), so the route and the
+# record are what can be checked.
+ENGINE_ROUTE=$(echo "${STATE}" | jq -r '[.resources | to_entries[] | select(.value.resourceType == "AWS::RDS::DBCluster" and (.key | test("EngineCluster"))) | "\(.value.provisionedBy // "sdk") \(.value.properties.MasterUserAuthenticationType // "absent")"] | first // "<no EngineCluster record>"')
+if [ "${ENGINE_ROUTE}" != "sdk password" ]; then
+  echo "FAIL: #5639: EngineCluster [provisionedBy, recorded MasterUserAuthenticationType] is '${ENGINE_ROUTE}', want 'sdk password' (MasterUserAuthenticationType is still SDK-unwired, so the cluster routed via Cloud Control)" >&2
+  exit 1
+fi
+echo "    OK: EngineCluster provisionedBy=sdk with MasterUserAuthenticationType password (#5639)"
+
+# go-to-k/cdkd#5639: the EngineCluster also declares ClusterScalabilityType,
+# BacktrackWindow and EnableLocalWriteForwarding, each SDK-unwired before
+# #5639 (the route check above fails a pre-fix cdkd). Live values, in one
+# line: [BacktrackWindow, write forwarding on/off, ClusterScalabilityType].
+# Forwarding reads as CloudFormation projects LocalWriteForwardingStatus:
+# `requested` / `enabled` are on. A status still in transition prints itself,
+# which no assertion accepts: the deploy returns only once it settled.
+# `standard` is AWS's default scalability type, so a describe that omits the
+# field reads as `standard`: only the route check discriminates that value.
+ENGINE_CLUSTER_ID=$(echo "${STATE}" | jq -r '.resources.EngineCluster.physicalId // ""')
+if [ -z "${ENGINE_CLUSTER_ID}" ]; then
+  echo "FAIL: #5639: could not resolve the EngineCluster identifier from state" >&2
+  exit 1
+fi
+# usage: engine_cluster_5639 -> "<window> <on|off|status> <scalability type>"
+engine_cluster_5639() {
+  local out
+  out=$(aws rds describe-db-clusters --db-cluster-identifier "${ENGINE_CLUSTER_ID}" \
+    --region "${REGION}" --output json) || return 1
+  echo "${out}" | jq -r '.DBClusters[0] | [(.BacktrackWindow // "absent" | tostring), (.LocalWriteForwardingStatus // "absent" | if . == "enabled" or . == "requested" then "on" elif . == "disabled" or . == "absent" then "off" else . end), (.ClusterScalabilityType // "standard")] | join(" ")'
+}
+ENGINE_5639=$(engine_cluster_5639) || { echo "FAIL: #5639: DescribeDBClusters on the EngineCluster failed" >&2; exit 1; }
+if [ "${ENGINE_5639}" != "3600 on standard" ]; then
+  echo "FAIL: #5639: phase 1: EngineCluster [BacktrackWindow, write forwarding, ClusterScalabilityType] is '${ENGINE_5639}', want '3600 on standard' (CreateDBCluster did not send them, or returned before forwarding settled)" >&2
+  exit 1
+fi
+echo "    OK: phase 1: EngineCluster backtracks 3600 s, forwards writes, scalability standard (#5639)"
+
 # Issue #4030 premise: the L1 SecurityCluster declares NO DeletionPolicy, so
 # its destroy applies CloudFormation's default for a DBCluster, Snapshot.
 SEC_DELETION_POLICY=$(echo "${STATE}" | jq -r '[.resources | to_entries[] | select(.value.resourceType == "AWS::RDS::DBCluster" and (.key | test("SecurityCluster"))) | .value.deletionPolicy // "absent"] | first // ""')
@@ -713,14 +770,39 @@ echo "    OK: phase 1: SecurityCluster exports postgresql (#5639)"
 # go-to-k/cdkd#5639: the scalars, in one line so a mismatch prints them all.
 # usage: sec_scalars <DescribeDBClusters JSON>
 sec_scalars() {
-  echo "${1}" | jq -r '[(.AutoMinorVersionUpgrade | tostring), (.PerformanceInsightsEnabled | tostring), (.PerformanceInsightsRetentionPeriod | tostring), (.NetworkType // "absent"), (.HttpEndpointEnabled // false | tostring)] | join(" ")'
+  echo "${1}" | jq -r '[(.AutoMinorVersionUpgrade | tostring), (.PerformanceInsightsEnabled | tostring), (.PerformanceInsightsRetentionPeriod | tostring), (.NetworkType // "absent"), (.HttpEndpointEnabled // false | tostring), (.DatabaseInsightsMode // "absent"), (.EngineLifecycleSupport // "absent")] | join(" ")'
 }
 BASE_SCALARS=$(sec_scalars "${CLUSTER}")
-if [ "${BASE_SCALARS}" != "false true 7 IPV4 true" ]; then
-  echo "FAIL: #5639: phase 1: SecurityCluster [AutoMinorVersionUpgrade, PerformanceInsightsEnabled, PerformanceInsightsRetentionPeriod, NetworkType, HttpEndpointEnabled] is '${BASE_SCALARS}', want 'false true 7 IPV4 true' (CreateDBCluster did not send them)" >&2
+if [ "${BASE_SCALARS}" != "false true 7 IPV4 true standard open-source-rds-extended-support-disabled" ]; then
+  echo "FAIL: #5639: phase 1: SecurityCluster [AutoMinorVersionUpgrade, PerformanceInsightsEnabled, PerformanceInsightsRetentionPeriod, NetworkType, HttpEndpointEnabled, DatabaseInsightsMode, EngineLifecycleSupport] is '${BASE_SCALARS}', want 'false true 7 IPV4 true standard open-source-rds-extended-support-disabled' (CreateDBCluster did not send them)" >&2
   exit 1
 fi
-echo "    OK: phase 1: SecurityCluster carries AutoMinorVersionUpgrade false, Performance Insights on (7 days), NetworkType IPV4 and the Data API on (#5639)"
+echo "    OK: phase 1: SecurityCluster carries AutoMinorVersionUpgrade false, Performance Insights on (7 days), NetworkType IPV4, the Data API on, Database Insights standard and Extended Support disabled (#5639)"
+
+# go-to-k/cdkd#5639: the associations, as `<role name>:<feature>` sorted (RDS
+# answers in its own order). cdkd returns once each change reads back. An
+# unread cluster or a missing list prints a marker, never the empty string a
+# detached list prints.
+# usage: sec_roles <DescribeDBClusters JSON>
+sec_roles() {
+  echo "${1}" | jq -r 'if type != "object" then "<no cluster read>" elif .AssociatedRoles == null then "<no AssociatedRoles field>" else ([.AssociatedRoles[] | ((.RoleArn | split("/") | last) + ":" + (.FeatureName // ""))] | sort | join(" ")) end'
+}
+# usage: state_role_name <logical id fragment> -> the IAM role's name from state
+state_role_name() {
+  echo "${STATE}" | jq -r --arg frag "$1" '[.resources | to_entries[] | select(.value.resourceType == "AWS::IAM::Role" and (.key | test($frag))) | .value.physicalId] | first // ""'
+}
+IMPORT_ROLE_NAME=$(state_role_name "SecurityS3ImportRole")
+EXPORT_ROLE_NAME=$(state_role_name "SecurityS3ExportRole")
+if [ -z "${IMPORT_ROLE_NAME}" ] || [ -z "${EXPORT_ROLE_NAME}" ]; then
+  echo "FAIL: #5639: could not resolve the SecurityCluster's import / export role names from state (got '${IMPORT_ROLE_NAME}' / '${EXPORT_ROLE_NAME}')" >&2
+  exit 1
+fi
+BASE_ROLES=$(sec_roles "${CLUSTER}")
+if [ "${BASE_ROLES}" != "${IMPORT_ROLE_NAME}:s3Import" ]; then
+  echo "FAIL: #5639: phase 1: SecurityCluster AssociatedRoles is '${BASE_ROLES}', want '${IMPORT_ROLE_NAME}:s3Import' (the create did not attach the declared role)" >&2
+  exit 1
+fi
+echo "    OK: phase 1: SecurityCluster has the import role attached for s3Import (#5639)"
 
 # --- Phase 1a: drift --revert restores a DECLARED Data API (#5707) -----
 # The template declares EnableHttpEndpoint: true. Turn the Data API off out of
@@ -856,6 +938,27 @@ if [ "${TAGS}" != "cdkd-drop=me cdkd-team=db" ]; then
   exit 1
 fi
 echo "    OK: Tags reached the target group on the SDK route (${TAGS})"
+
+# go-to-k/cdkd#5639: phase 1b changes the EngineCluster's BacktrackWindow
+# 3600 -> 7200 (keyed on CDKD_TEST_TG_TAGS); ModifyDBCluster must send it.
+ENGINE_5639=$(engine_cluster_5639) || { echo "FAIL: #5639: DescribeDBClusters on the EngineCluster failed" >&2; exit 1; }
+if [ "${ENGINE_5639}" != "7200 on standard" ]; then
+  echo "FAIL: #5639: phase 1b: EngineCluster [BacktrackWindow, write forwarding, ClusterScalabilityType] is '${ENGINE_5639}', want '7200 on standard' (the changed BacktrackWindow was not sent, or the update returned before it applied)" >&2
+  exit 1
+fi
+echo "    OK: phase 1b: EngineCluster BacktrackWindow changed to 7200 s in place (#5639)"
+
+# go-to-k/cdkd#5639: phase 1b swapped the import role (s3Import) for the export
+# role (s3Export). cdkd returns once the detach and the attach read back, so
+# one read decides: a cdkd sending neither call keeps the import role.
+ROLES_1B_JSON=$(aws rds describe-db-clusters --db-cluster-identifier "${DB_CLUSTER_ID}" \
+  --region "${REGION}" --query 'DBClusters[0]' --output json)
+ROLES_1B=$(sec_roles "${ROLES_1B_JSON}")
+if [ "${ROLES_1B}" != "${EXPORT_ROLE_NAME}:s3Export" ]; then
+  echo "FAIL: #5639: phase 1b: SecurityCluster AssociatedRoles is '${ROLES_1B}', want '${EXPORT_ROLE_NAME}:s3Export' (the update must detach the dropped import role and attach the export role)" >&2
+  exit 1
+fi
+echo "    OK: phase 1b: SecurityCluster detached the import role and attached the export role for s3Export (#5639)"
 
 # --- Phase 1c: a cc-api record returns to the SDK provider (issue #4087) --
 echo "==> Phase 1c: seed provisionedBy=cc-api, then redeploy with changed Tags (CDKD_TEST_TG_TAGS=v2)"
@@ -1035,6 +1138,25 @@ rm -f "${DEPLOY_2_LOG}"
 DEPLOY_2_LOG=""
 printf '%s\n' "${DEPLOY_2_PLAIN}"
 
+# go-to-k/cdkd#5639: phase 2 DROPS the EngineCluster's BacktrackWindow (sent
+# nothing, so the live 7200 is kept) and EnableLocalWriteForwarding: true
+# (sent false, as CloudFormation's handler does, so forwarding is off). The
+# disable is the witness that this deploy's ModifyDBCluster reached the
+# cluster, so the kept window is not vacuous. The record must hold neither.
+ENGINE_5639=$(engine_cluster_5639) || { echo "FAIL: #5639: DescribeDBClusters on the EngineCluster failed" >&2; exit 1; }
+if [ "${ENGINE_5639}" != "7200 off standard" ]; then
+  echo "FAIL: #5639: phase 2: EngineCluster [BacktrackWindow, write forwarding, ClusterScalabilityType] is '${ENGINE_5639}', want '7200 off standard' (a removed BacktrackWindow keeps the live window; a removed EnableLocalWriteForwarding: true turns forwarding off)" >&2
+  exit 1
+fi
+ENGINE_5639_STATE=$(aws s3 cp "s3://${STATE_BUCKET}/${STATE_KEY}" -) \
+  || { echo "FAIL: #5639: could not read the state file" >&2; exit 1; }
+ENGINE_5639_RECORD=$(echo "${ENGINE_5639_STATE}" | jq -r '.resources.EngineCluster | "\(.provisionedBy // "sdk") \(if .properties | has("BacktrackWindow") then (.properties.BacktrackWindow | tostring) else "absent" end) \(if .properties | has("EnableLocalWriteForwarding") then (.properties.EnableLocalWriteForwarding | tostring) else "absent" end)"')
+if [ "${ENGINE_5639_RECORD}" != "sdk absent absent" ]; then
+  echo "FAIL: #5639: phase 2: EngineCluster record [provisionedBy, BacktrackWindow, EnableLocalWriteForwarding] is '${ENGINE_5639_RECORD}', want 'sdk absent absent'" >&2
+  exit 1
+fi
+echo "    OK: phase 2: dropping BacktrackWindow kept 7200 s, dropping EnableLocalWriteForwarding turned forwarding off (#5639)"
+
 # --- #1160 DBProxy removal: kept on AWS, and warned about -------------
 if ! grep -qF "${PROXY_LOGICAL} (AWS::RDS::DBProxy): property DebugLogging was removed from the template and keeps its current AWS value, as CloudFormation leaves it; ModifyDBProxy keeps a setting it is not sent" <<<"${DEPLOY_2_PLAIN}"; then
   echo "FAIL: #1160: phase 2 dropped DebugLogging from ${PROXY_LOGICAL}, but the deploy printed no warning naming it as left in place" >&2
@@ -1209,15 +1331,26 @@ if [ "${AFTER_LOGS}" != "iam-db-auth-error pending=null" ]; then
 fi
 echo "    OK: phase 2: SecurityCluster exports iam-db-auth-error only; postgresql was disabled (#5639)"
 
-# go-to-k/cdkd#5639: phase 2 flipped AutoMinorVersionUpgrade, raised the
-# Performance Insights retention and dropped EnableHttpEndpoint. cdkd returns
-# once the Data API reports off, so the same read decides.
-AFTER_SCALARS=$(sec_scalars "${AFTER_LOGS_JSON}")
-if [ "${AFTER_SCALARS}" != "true true 31 IPV4 false" ]; then
-  echo "FAIL: #5639: phase 2: SecurityCluster [AutoMinorVersionUpgrade, PerformanceInsightsEnabled, PerformanceInsightsRetentionPeriod, NetworkType, HttpEndpointEnabled] is '${AFTER_SCALARS}', want 'true true 31 IPV4 false' (ModifyDBCluster must send the changed flag and retention; the removed EnableHttpEndpoint must turn the Data API off)" >&2
+# go-to-k/cdkd#5639: phase 2 dropped AssociatedRoles; phase 1b asserted the
+# export role live. cdkd returns once the detach reads back, so the same read
+# decides: a cdkd sending nothing on a removal keeps the export role.
+AFTER_ROLES=$(sec_roles "${AFTER_LOGS_JSON}")
+if [ "${AFTER_ROLES}" != "" ]; then
+  echo "FAIL: #5639: phase 2: SecurityCluster AssociatedRoles is '${AFTER_ROLES}', want none (a removed AssociatedRoles must detach the recorded export role)" >&2
   exit 1
 fi
-echo "    OK: phase 2: AutoMinorVersionUpgrade true, retention 31 days, Data API off after its removal (#5639)"
+echo "    OK: phase 2: the removed AssociatedRoles detached the export role (#5639)"
+
+# go-to-k/cdkd#5639: phase 2 flipped AutoMinorVersionUpgrade, raised the
+# Performance Insights retention to 465 days with DatabaseInsightsMode
+# `advanced`, and dropped EnableHttpEndpoint. cdkd returns once the Data API
+# reports off, so the same read decides. EngineLifecycleSupport is unchanged.
+AFTER_SCALARS=$(sec_scalars "${AFTER_LOGS_JSON}")
+if [ "${AFTER_SCALARS}" != "true true 465 IPV4 false advanced open-source-rds-extended-support-disabled" ]; then
+  echo "FAIL: #5639: phase 2: SecurityCluster [AutoMinorVersionUpgrade, PerformanceInsightsEnabled, PerformanceInsightsRetentionPeriod, NetworkType, HttpEndpointEnabled, DatabaseInsightsMode, EngineLifecycleSupport] is '${AFTER_SCALARS}', want 'true true 465 IPV4 false advanced open-source-rds-extended-support-disabled' (ModifyDBCluster must send the changed flag, retention and Database Insights mode; the removed EnableHttpEndpoint must turn the Data API off)" >&2
+  exit 1
+fi
+echo "    OK: phase 2: AutoMinorVersionUpgrade true, retention 465 days, Database Insights advanced, Data API off after its removal (#5639)"
 
 # Phase 2 sets no CDKD_TEST_TG_TAGS, so the template dropped Tags (#4087).
 TAGS=$(tg_tags "${TG_ARN}")

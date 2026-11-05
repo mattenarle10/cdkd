@@ -21,11 +21,17 @@ import {
   ListTagsForResourceCommand,
   AddTagsToResourceCommand,
   RemoveTagsFromResourceCommand,
+  AddRoleToDBClusterCommand,
+  RemoveRoleFromDBClusterCommand,
+  AddRoleToDBInstanceCommand,
+  RemoveRoleFromDBInstanceCommand,
   type CloudwatchLogsExportConfiguration,
   type DBCluster,
   type DBInstance,
   type PendingCloudwatchLogsExports,
+  type MasterUserAuthenticationType,
   type ModifyDBClusterCommandInput,
+  type CreateDBClusterCommandInput,
   type ModifyDBInstanceCommandInput,
   type CreateDBInstanceCommandInput,
 } from '@aws-sdk/client-rds';
@@ -45,10 +51,14 @@ import {
   maskerOrIdentity,
   withDerivedNameMasks,
 } from '../masked-retry-logger.js';
-import { ProvisioningError, ResourceUpdateNotSupportedError } from '../../utils/error-handler.js';
+import {
+  CdkdError,
+  ProvisioningError,
+  ResourceUpdateNotSupportedError,
+} from '../../utils/error-handler.js';
 import { markDeleteStarted, type DeleteProgress } from '../delete-started.js';
 import { markNotGone } from '../not-gone.js';
-import { markCreatedBeforeFailure } from '../auxiliary-failure.js';
+import { markAuxiliaryFailure, markCreatedBeforeFailure } from '../auxiliary-failure.js';
 import { reportCreatedResource, retractCreatedResource } from '../created-resource-sink.js';
 import { assertRegionMatch, type DeleteContext } from '../region-check.js';
 import { generatedNameFor } from '../resource-name.js';
@@ -85,8 +95,23 @@ import {
   deleteAfterProtectionFlipWithFinalSnapshot,
   isTerminalDbWaitStatus,
 } from './deletion-protection-compensation.js';
-import { modifyDbInstanceWhenAvailable } from './db-instance-modify-retry.js';
+import {
+  isModifyNotAvailableRefusal,
+  modifyDbInstanceWhenAvailable,
+} from './db-instance-modify-retry.js';
 import { withoutServerErrorRetries } from './ambiguous-create.js';
+import {
+  associatedRoleArns,
+  associatedRoleKey,
+  associatedRoleList,
+  associatedRolesNamed,
+  associatedRolesReadback,
+  canonicalAssociatedRoles,
+  isRoleCallNotAvailableRefusal,
+  planAssociatedRoleChanges,
+  type AssociatedRole,
+  type LiveAssociatedRole,
+} from './db-associated-roles.js';
 import { dbInstanceEngineChangeIsInPlace } from '../../analyzer/replacement-rules.js';
 import { dynamicReferenceTokens, SECRET_MASK } from '../../deployment/secret-redaction.js';
 
@@ -191,6 +216,113 @@ function masterCredentialSettingsChanged(
       context
     )
   );
+}
+
+/**
+ * go-to-k/cdkd#5639 / #5640: whether `ManageMasterUserPassword` rides the
+ * Modify* call: a master-credential change (`masterCredentialSettingsChanged`)
+ * or a `MasterUserAuthenticationType` the call sends, which RDS refuses unless the
+ * same call sets the managed password (below). The `MasterUserSecret` KMS
+ * key rides a type change only when it switches to `password` with the managed
+ * password declared, the call that turns it on
+ * (`passwordAuthenticationCompanion`): RDS takes a key only then, so
+ * re-sending it on a resource already managed would be refused.
+ *
+ * RDS refuses `iam-db-auth` beside a managed password unless the same
+ * call turns it off (`ManageMasterUserPassword: false`), and refuses
+ * `password` unless the same call carries a password or turns the managed one
+ * on (measured with ModifyDBCluster / ModifyDBInstance, us-east-1, 2026-11-04).
+ * CloudFormation's DBCluster handler sends `ManageMasterUserPassword` on every
+ * update, so a switch declaring the managed password succeeds there too.
+ */
+function managedPasswordSettingRides(
+  credentialSettingsChanged: boolean,
+  authenticationType: MasterUserAuthenticationType | undefined
+): boolean {
+  // `authenticationType` is what the call SENDS: a rollback replay that drops
+  // the type (no password declared) passes `undefined`, so no lone
+  // `ManageMasterUserPassword` goes out, which RDS refuses.
+  return credentialSettingsChanged || authenticationType !== undefined;
+}
+
+/**
+ * go-to-k/cdkd#5639 / #5640: what a ModifyDBCluster / ModifyDBInstance that
+ * switches `MasterUserAuthenticationType` to `password` must carry beside it.
+ * RDS refuses `password` unless the same call carries a master password or
+ * turns the managed password on ("You must specify a master password ...",
+ * measured us-east-1, 2026-11-04), whichever direction the switch takes (a
+ * rollback replay of a forward `password` -> `iam-db-auth` included).
+ *
+ * - `managed`: the template declares `ManageMasterUserPassword: true`, which
+ *   rides the call (`managedPasswordSettingRides`). That call creates the
+ *   managed secret, so the declared `MasterUserSecret` KMS key rides it too,
+ *   or the secret would land on `aws/secretsmanager` unnoticed.
+ * - `password`: the declared `MasterUserPassword` rides the call, even when
+ *   unchanged. Never logged.
+ * - `missing`: neither is declared; the caller refuses before any call. This
+ *   includes an explicit ADD of the default `password` (the record lacks the
+ *   type), e.g. on a snapshot-restored cluster: whether RDS accepts a type
+ *   equal to the live one without a password is unmeasured, so cdkd refuses
+ *   rather than guess. A
+ *   rollback replay instead drops the type (with a warning) and reverts the
+ *   other members, since RDS would reject the whole call.
+ * - `undefined`: the call does not switch to `password`.
+ */
+function passwordAuthenticationCompanion(
+  properties: Record<string, unknown>,
+  previousProperties: Record<string, unknown>,
+  authenticationType: MasterUserAuthenticationType | undefined
+): { kind: 'managed' } | { kind: 'password'; password: string } | { kind: 'missing' } | undefined {
+  if (authenticationType !== 'password') return undefined;
+  if (String(properties['ManageMasterUserPassword']) === 'true') {
+    // Only a switch FROM another recorded type turns the managed secret on. An
+    // added `password` (the record lacks the type) on a resource already
+    // managed must not re-send the key, which RDS refuses there.
+    const previous = previousProperties['MasterUserAuthenticationType'];
+    return previous != null && previous !== '' && previous !== 'password'
+      ? { kind: 'managed' }
+      : undefined;
+  }
+  // An added `password` on a literal-password resource re-sends the unchanged
+  // declared password once; RDS needs it beside the type either way.
+  const password = properties['MasterUserPassword'];
+  return typeof password === 'string' && password !== ''
+    ? { kind: 'password', password }
+    : { kind: 'missing' };
+}
+
+/** The refusal text of a switch to `password` with no password (`passwordAuthenticationCompanion`). */
+function passwordAuthenticationMissingText(resourceType: string, logicalId: string): string {
+  return (
+    `${resourceType} ${logicalId}: MasterUserAuthenticationType changes to password, which RDS ` +
+    `accepts only beside a master password or the managed one in the same call, and the ` +
+    `template declares neither MasterUserPassword nor ManageMasterUserPassword: true. ` +
+    `Nothing was applied. Declare one of them.`
+  );
+}
+
+/**
+ * go-to-k/cdkd#5639 / #5640: the `MasterUserAuthenticationType` a
+ * ModifyDBCluster / ModifyDBInstance carries: the declared value when the
+ * template changed it, else `undefined`. A removal sends nothing and RDS keeps
+ * the live type. Measured against CloudFormation (us-east-1, 2026-11-04,
+ * CloudTrail): both handlers send a changed value and nothing for a removal.
+ * The property is write-only in the registry schema and absent from the
+ * Describe shapes, so no readback can confirm it.
+ */
+function masterUserAuthenticationTypeToSend(
+  properties: Record<string, unknown>,
+  previousProperties: Record<string, unknown>,
+  context: UpdateContext | undefined
+): MasterUserAuthenticationType | undefined {
+  return instanceValueChanged(
+    properties,
+    previousProperties,
+    'MasterUserAuthenticationType',
+    context
+  )
+    ? (properties['MasterUserAuthenticationType'] as MasterUserAuthenticationType)
+    : undefined;
 }
 
 /**
@@ -725,6 +857,93 @@ function withPreviousAvailabilityZone(
   return previous === undefined ? rest : { ...rest, AvailabilityZone: previous };
 }
 
+/** An `EngineLifecycleSupport` read off a bag: `undefined` when absent or empty. */
+function engineLifecycleSupportOf(bag: Record<string, unknown>): string | undefined {
+  const value = bag['EngineLifecycleSupport'];
+  return value == null || value === '' ? undefined : String(value as string);
+}
+
+/**
+ * go-to-k/cdkd#5639 / #5640: what an update does with `EngineLifecycleSupport`
+ * on a DB cluster or DB instance. CloudFormation's update handlers refuse any
+ * difference between the previous and desired template values, a change, an
+ * addition and a removal alike ("EngineLifecycleSupport cannot be modified.",
+ * measured on both types, us-east-1, 2026-11-04), outside a rollback, and
+ * their ModifyDBCluster / ModifyDBInstance never carry it. So:
+ *
+ * - `'unchanged'`: the two sides agree, or a rollback replay (CloudFormation's
+ *   rollback skips the check and sends nothing): nothing is sent.
+ * - `'send'`: `cdkd drift --revert` restoring the recorded live value, which
+ *   ModifyDB* takes; CloudFormation has no revert to compare with.
+ * - `'check-live'`: a declared value differing from the record. It is no
+ *   change when the live resource already holds it (a record that lacks or
+ *   predates it, or a value set with the AWS CLI), as for a DB instance's
+ *   `AvailabilityZone`; otherwise refused, as CloudFormation refuses it.
+ * - `'refuse'`: a removal, which CloudFormation refuses too.
+ */
+function engineLifecycleSupportAction(
+  properties: Record<string, unknown>,
+  previousProperties: Record<string, unknown>,
+  context: UpdateContext | undefined
+): 'unchanged' | 'send' | 'check-live' | 'refuse' {
+  const desired = engineLifecycleSupportOf(properties);
+  if (desired === engineLifecycleSupportOf(previousProperties)) return 'unchanged';
+  if (context?.replayingState === true) return 'unchanged';
+  if (context?.desiredFromAwsReadback === true) return desired === undefined ? 'unchanged' : 'send';
+  return desired === undefined ? 'refuse' : 'check-live';
+}
+
+/**
+ * The refusal text of a changed `EngineLifecycleSupport`
+ * (`engineLifecycleSupportAction`), unmasked: the caller masks it.
+ */
+function engineLifecycleSupportRefusalText(
+  resourceType: string,
+  logicalId: string,
+  physicalId: string,
+  kind: 'DB cluster' | 'DB instance',
+  liveRead: 'read' | 'unreadable' | 'not-found'
+): string {
+  const cli = kind === 'DB cluster' ? 'aws rds modify-db-cluster' : 'aws rds modify-db-instance';
+  return (
+    `${resourceType} ${logicalId}: EngineLifecycleSupport cannot change on an existing ${kind}. ` +
+    `CloudFormation refuses the same update ("EngineLifecycleSupport cannot be modified."), ` +
+    `whether the value changes, is added or is removed. Nothing was applied to ${kind} ${physicalId}. ` +
+    (liveRead === 'unreadable'
+      ? `cdkd could not read the live setting (an AWS read failed), so it could not tell ` +
+        `whether the ${kind} already holds the declared value; a re-run may succeed. `
+      : liveRead === 'not-found'
+        ? `RDS reports no such ${kind}: it was deleted outside cdkd, so the state record no ` +
+          `longer matches AWS. `
+        : '') +
+    `Declare the value the previous deploy declared (or none, if it declared none). To change ` +
+    `the live setting, run ${cli} with --engine-lifecycle-support and --apply-immediately, then ` +
+    `declare that value: a declared value the ${kind} already holds is no change.`
+  );
+}
+
+/**
+ * go-to-k/cdkd#5639: how long a `--remove-protection` flip waits, across its
+ * retries, for a busy DB cluster or DB instance to accept it.
+ */
+const PROTECTION_FLIP_RETRY_WAIT_MS = 10 * 60_000;
+
+/**
+ * go-to-k/cdkd#5639: whether `error` is RDS refusing a ModifyDBCluster because
+ * the cluster is busy: "This cluster could not be modified. Please try again"
+ * (`InvalidDBClusterStateFault`, read us-east-1, 2026-11-04, while a member
+ * that had just joined was still taking the cluster's settings), or the
+ * not-`available` wording. Read off the RAW SDK error.
+ */
+function isClusterBusyRefusal(error: unknown): boolean {
+  if (isModifyNotAvailableRefusal(error)) return true;
+  return (
+    error instanceof Error &&
+    error.name === 'InvalidDBClusterStateFault' &&
+    /could not be modified\. Please try again/i.test(error.message)
+  );
+}
+
 /** The template's `AWS::RDS::DBCluster` `ServerlessV2ScalingConfiguration`. */
 interface ServerlessV2ScalingProps {
   MinCapacity?: number;
@@ -836,6 +1055,11 @@ type ClusterScalarMembers = Pick<
   | 'EnablePerformanceInsights'
   | 'PerformanceInsightsKMSKeyId'
   | 'PerformanceInsightsRetentionPeriod'
+  | 'DatabaseInsightsMode'
+  | 'EngineLifecycleSupport'
+  | 'MasterUserAuthenticationType'
+  | 'BacktrackWindow'
+  | 'EnableLocalWriteForwarding'
 >;
 
 /** go-to-k/cdkd#5639: the CFn name of each Performance Insights member, with its SDK name. */
@@ -877,6 +1101,28 @@ function clusterCreateScalarMembers(properties: Record<string, unknown>): Cluste
       NetworkType: properties['NetworkType'] as string,
     }),
     ...clusterPerformanceInsightsMembers(properties),
+    ...(properties['DatabaseInsightsMode'] != null && {
+      DatabaseInsightsMode: properties[
+        'DatabaseInsightsMode'
+      ] as ClusterScalarMembers['DatabaseInsightsMode'],
+    }),
+    ...(engineLifecycleSupportOf(properties) !== undefined && {
+      EngineLifecycleSupport: engineLifecycleSupportOf(properties),
+    }),
+    ...(properties['MasterUserAuthenticationType'] != null && {
+      MasterUserAuthenticationType: properties[
+        'MasterUserAuthenticationType'
+      ] as ClusterScalarMembers['MasterUserAuthenticationType'],
+    }),
+    // A malformed one is refused or skipped before any call.
+    ...(typeof backtrackWindowValue(properties['BacktrackWindow']) === 'number' && {
+      BacktrackWindow: backtrackWindowValue(properties['BacktrackWindow']) as number,
+    }),
+    ...(typeof localWriteForwardingFlag(properties['EnableLocalWriteForwarding']) === 'boolean' && {
+      EnableLocalWriteForwarding: localWriteForwardingFlag(
+        properties['EnableLocalWriteForwarding']
+      ) as boolean,
+    }),
   };
 }
 
@@ -892,6 +1138,22 @@ function clusterCreateScalarMembers(properties: Record<string, unknown>): Cluste
  * A removal sends nothing and RDS keeps the live value: the handler sends the
  * desired value, `null` (unsent) for a removed key, and
  * `ModelAdapter.setDefaults` fills none of these.
+ *
+ * `DatabaseInsightsMode` likewise goes out only when changed, with the declared
+ * Performance Insights members beside it (`advanced` needs them on with a
+ * 465-day retention). Measured against CloudFormation (us-east-1, 2026-11-04,
+ * CloudTrail): a changed mode is sent with the trio, and a removed `advanced`
+ * sends no mode and stays `advanced`.
+ *
+ * `BacktrackWindow` goes out only when changed, and a removal keeps the live
+ * window: the handler sends the desired value, unsent when removed (read from
+ * the archived `aws-cloudformation-resource-providers-rds` source, not
+ * measured). `EnableLocalWriteForwarding` follows the handler's own rule
+ * (`localWriteForwardingToSend`).
+ *
+ * `EngineLifecycleSupport` and
+ * `MasterUserAuthenticationType` are not here: `engineLifecycleSupportAction`
+ * and `masterUserAuthenticationTypeToSend` decide them.
  */
 function clusterModifyScalarMembers(
   properties: Record<string, unknown>,
@@ -905,10 +1167,102 @@ function clusterModifyScalarMembers(
     members.AutoMinorVersionUpgrade = properties['AutoMinorVersionUpgrade'] as boolean;
   }
   if (changed('NetworkType')) members.NetworkType = properties['NetworkType'] as string;
-  if (CLUSTER_PERFORMANCE_INSIGHTS_MEMBERS.some(([key]) => changed(key))) {
+  // `DatabaseInsightsMode` `advanced` needs Performance Insights on with a
+  // 465-day retention, so a changed mode sends the declared trio beside it.
+  const insightsModeChanged = changed('DatabaseInsightsMode');
+  if (insightsModeChanged || CLUSTER_PERFORMANCE_INSIGHTS_MEMBERS.some(([key]) => changed(key))) {
     Object.assign(members, clusterPerformanceInsightsMembers(properties));
   }
+  if (insightsModeChanged) {
+    members.DatabaseInsightsMode = properties[
+      'DatabaseInsightsMode'
+    ] as ClusterScalarMembers['DatabaseInsightsMode'];
+  }
+  // A malformed one is refused or skipped before any call.
+  const backtrackWindow = backtrackWindowValue(properties['BacktrackWindow']);
+  if (typeof backtrackWindow === 'number' && changed('BacktrackWindow')) {
+    members.BacktrackWindow = backtrackWindow;
+  }
+  const localWriteForwarding = localWriteForwardingToSend(properties, previousProperties, context);
+  if (typeof localWriteForwarding === 'boolean') {
+    members.EnableLocalWriteForwarding = localWriteForwarding;
+  }
   return members;
+}
+
+/**
+ * go-to-k/cdkd#5639: a DBCluster `BacktrackWindow` read off a bag, in seconds:
+ * `undefined` when absent, the whole number (a number or its numeric-string
+ * spelling), or `'malformed'`. The 0-259200 range is AWS's to enforce.
+ */
+function backtrackWindowValue(value: unknown): number | undefined | 'malformed' {
+  return retentionPeriodValue(value);
+}
+
+/**
+ * go-to-k/cdkd#5639: a DBCluster `EnableLocalWriteForwarding` read off a bag,
+ * as {@link httpEndpointFlag} reads the Data API flag.
+ */
+function localWriteForwardingFlag(value: unknown): boolean | undefined | 'malformed' {
+  return httpEndpointFlag(value);
+}
+
+/**
+ * go-to-k/cdkd#5639: the `EnableLocalWriteForwarding` an update sends, as
+ * CloudFormation's update translation (`Translator.modifyDbClusterRequest`)
+ * decides it: a removed `true` sends `false`, because RDS keeps write
+ * forwarding on until told otherwise; a `false` declared where the previous
+ * template declared nothing sends nothing, since forwarding is off by default;
+ * otherwise only a changed value goes out (`instanceValueChanged`). Any other
+ * removal sends nothing. A malformed desired value is refused or skipped
+ * before this runs; a malformed previous one reads as absent.
+ *
+ * A drift revert turns forwarding ON only when the record's template side
+ * declares `EnableLocalWriteForwarding: true`
+ * (`UpdateContext.declaredTrueProperties`), as `clusterHttpEndpointAction`
+ * does for the Data API: the revert's desired bag is the recorded readback,
+ * which can hold `true` for a template that never declared it. Otherwise it is
+ * `'withheld'`; turning forwarding off still goes through.
+ */
+function localWriteForwardingToSend(
+  properties: Record<string, unknown>,
+  previousProperties: Record<string, unknown>,
+  context: UpdateContext | undefined
+): boolean | 'withheld' | undefined {
+  const desired = localWriteForwardingFlag(properties['EnableLocalWriteForwarding']);
+  const previousFlag = localWriteForwardingFlag(previousProperties['EnableLocalWriteForwarding']);
+  const previous = typeof previousFlag === 'boolean' ? previousFlag : undefined;
+  if (desired === undefined) return previous === true ? false : undefined;
+  if (desired === 'malformed') return undefined;
+  if (previous === undefined && desired === false) return undefined;
+  if (
+    !instanceValueChanged(properties, previousProperties, 'EnableLocalWriteForwarding', context)
+  ) {
+    return undefined;
+  }
+  return desired &&
+    context?.desiredFromAwsReadback === true &&
+    context.declaredTrueProperties?.has('EnableLocalWriteForwarding') !== true
+    ? 'withheld'
+    : desired;
+}
+
+/**
+ * go-to-k/cdkd#5639: whether a cluster's local write forwarding has reached
+ * `enabled`. CloudFormation's stabilization
+ * (`BaseHandlerStd.isLocalWriteForwardingStabilized`) waits while the status
+ * is `enabling` or `disabling`, and its read handler projects `requested` and
+ * `enabled` as on (`Translator.translateLocalWriteForwardingStatus`). The
+ * status is matched against the value sent, not only "not in transition", so a
+ * describe answering before the change starts does not end the wait.
+ */
+function localWriteForwardingApplied(cluster: DBCluster, enabled: boolean): boolean {
+  const status = cluster.LocalWriteForwardingStatus;
+  // Never reported: nothing to wait on, as CloudFormation's check waits only
+  // while the status is `enabling` / `disabling`.
+  if (status === undefined) return true;
+  if (status === 'enabling' || status === 'disabling') return false;
+  return (status === 'requested' || status === 'enabled') === enabled;
 }
 
 /**
@@ -928,6 +1282,7 @@ const CLUSTER_BOOLEAN_SCALARS = [
   'AutoMinorVersionUpgrade',
   'PerformanceInsightsEnabled',
   'EnableHttpEndpoint',
+  'EnableLocalWriteForwarding',
 ] as const;
 
 /**
@@ -1035,6 +1390,10 @@ const usableHttpEndpoint = (value: unknown): boolean =>
   typeof httpEndpointFlag(value) === 'boolean';
 const usableRetentionPeriod = (value: unknown): boolean =>
   typeof retentionPeriodValue(value) === 'number';
+const usableBacktrackWindow = (value: unknown): boolean =>
+  typeof backtrackWindowValue(value) === 'number';
+const usableLocalWriteForwarding = (value: unknown): boolean =>
+  typeof localWriteForwardingFlag(value) === 'boolean';
 
 /**
  * go-to-k/cdkd#2762: whether this cluster update changes `EngineVersion`, the
@@ -1268,6 +1627,23 @@ export class RDSProvider implements ResourceProvider {
         'PerformanceInsightsKmsKeyId',
         'PerformanceInsightsRetentionPeriod',
         'EnableHttpEndpoint',
+        // go-to-k/cdkd#5639: ride CreateDBCluster and, when changed,
+        // ModifyDBCluster under the same names (`clusterModifyScalarMembers`).
+        'DatabaseInsightsMode',
+        'EngineLifecycleSupport',
+        'MasterUserAuthenticationType',
+        // go-to-k/cdkd#5639: `BacktrackWindow` and `EnableLocalWriteForwarding`
+        // ride CreateDBCluster and, when changed, ModifyDBCluster
+        // (`clusterModifyScalarMembers`; a removed `EnableLocalWriteForwarding:
+        // true` turns forwarding off). `ClusterScalabilityType` is create-only
+        // and rides CreateDBCluster alone.
+        'BacktrackWindow',
+        'EnableLocalWriteForwarding',
+        'ClusterScalabilityType',
+        // go-to-k/cdkd#5639: AddRoleToDBCluster / RemoveRoleFromDBCluster once
+        // the cluster is `available`, planned against the live list
+        // (`applyAssociatedRoles`).
+        'AssociatedRoles',
       ]),
     ],
     [
@@ -1359,6 +1735,13 @@ export class RDSProvider implements ResourceProvider {
         // refused as CloudFormation refuses it (`instanceAvailabilityZoneKept`).
         'DBName',
         'AvailabilityZone',
+        // go-to-k/cdkd#5640: ride CreateDBInstance and, when changed,
+        // ModifyDBInstance under the same names (`instanceModifyBackfillMembers`).
+        'EngineLifecycleSupport',
+        'MasterUserAuthenticationType',
+        // go-to-k/cdkd#5640: AddRoleToDBInstance / RemoveRoleFromDBInstance
+        // once the instance is `available` (`applyAssociatedRoles`).
+        'AssociatedRoles',
       ]),
     ],
   ]);
@@ -1470,7 +1853,13 @@ export class RDSProvider implements ResourceProvider {
           context?.replayingState === true
         );
       case 'AWS::RDS::DBInstance':
-        return this.createDBInstance(logicalId, resourceType, properties, mask);
+        return this.createDBInstance(
+          logicalId,
+          resourceType,
+          properties,
+          mask,
+          context?.replayingState === true
+        );
       default:
         throw new ProvisioningError(
           `Unsupported resource type: ${resourceType}`,
@@ -1824,13 +2213,47 @@ export class RDSProvider implements ResourceProvider {
         safeMsg`DBCluster ${logicalId}: the replayed PerformanceInsightsRetentionPeriod is not a whole number of days; the cluster is created with AWS's default retention`
       );
     }
+    // go-to-k/cdkd#5639: likewise the backtrack window and the write-forwarding
+    // flag; a rollback re-create sends neither (AWS's defaults: both off).
+    const backtrackSkipped = backtrackWindowValue(properties['BacktrackWindow']) === 'malformed';
+    const forwardingSkipped =
+      localWriteForwardingFlag(properties['EnableLocalWriteForwarding']) === 'malformed';
+    for (const [skipped, key, expected, created] of [
+      [backtrackSkipped, 'BacktrackWindow', 'a whole number of seconds', 'backtracking off'],
+      [forwardingSkipped, 'EnableLocalWriteForwarding', 'true or false', 'write forwarding off'],
+    ] as const) {
+      if (!skipped) continue;
+      if (!replaying) {
+        throw markNonRetryable(
+          new ProvisioningError(
+            `${resourceType} ${logicalId}: ${key} must be ${expected}`,
+            resourceType,
+            logicalId
+          )
+        );
+      }
+      this.logger.warn(
+        safeMsg`DBCluster ${logicalId}: the replayed ${key} is not ${expected}; the cluster is created with ${created}`
+      );
+    }
+    // go-to-k/cdkd#5639: refused before any call when malformed.
+    const roles = this.desiredAssociatedRoles(
+      properties,
+      resourceType,
+      logicalId,
+      undefined,
+      replaying
+    );
     // What the call sent: a record without a skipped key
     // (provider-property-fidelity: a replay-create that skipped drops the key).
     const skippedKeys = [
+      ...(roles === 'skipped' ? ['AssociatedRoles'] : []),
       ...(properties['EnableHttpEndpoint'] != null && httpEndpoint === undefined
         ? ['EnableHttpEndpoint']
         : []),
       ...(retentionSkipped ? ['PerformanceInsightsRetentionPeriod'] : []),
+      ...(backtrackSkipped ? ['BacktrackWindow'] : []),
+      ...(forwardingSkipped ? ['EnableLocalWriteForwarding'] : []),
     ];
     const effectiveProperties =
       skippedKeys.length > 0
@@ -1914,6 +2337,12 @@ export class RDSProvider implements ResourceProvider {
           // provisioned and Serverless v2 clusters).
           ...clusterCreateScalarMembers(properties),
           ...(httpEndpoint !== undefined && { EnableHttpEndpoint: httpEndpoint }),
+          // go-to-k/cdkd#5639: create-only (a change replaces the cluster).
+          ...(properties['ClusterScalabilityType'] != null && {
+            ClusterScalabilityType: properties[
+              'ClusterScalabilityType'
+            ] as CreateDBClusterCommandInput['ClusterScalabilityType'],
+          }),
           ...(tags.length > 0 && { Tags: tags }),
         })
       );
@@ -1952,6 +2381,37 @@ export class RDSProvider implements ResourceProvider {
         // Wait for cluster to become available (skip with --no-wait)
         if (process.env['CDKD_NO_WAIT'] !== 'true') {
           await this.waitForClusterAvailable(logicalId, dbClusterIdentifier);
+          // go-to-k/cdkd#5639: CloudFormation's create stabilizes only once
+          // local write forwarding is no longer `enabling`
+          // (`BaseHandlerStd.isLocalWriteForwardingStabilized`).
+          if (localWriteForwardingFlag(properties['EnableLocalWriteForwarding']) === true) {
+            await this.waitForClusterState(
+              logicalId,
+              dbClusterIdentifier,
+              (cluster) => localWriteForwardingApplied(cluster, true),
+              'local write forwarding setting'
+            );
+          }
+        }
+
+        // go-to-k/cdkd#5639: once the cluster is available, as CloudFormation's
+        // create handler attaches them (`addAssociatedRoles`). A role's failure
+        // is not this cluster name's collision (#3826).
+        if (roles !== 'skipped') {
+          try {
+            await this.applyAssociatedRoles(
+              'cluster',
+              logicalId,
+              dbClusterIdentifier,
+              roles,
+              [],
+              mask,
+              undefined
+            );
+          } catch (roleError) {
+            markAuxiliaryFailure(roleError, logicalId);
+            throw roleError;
+          }
         }
 
         // Describe to get final attributes
@@ -2089,6 +2549,14 @@ export class RDSProvider implements ResourceProvider {
     this.logger.debug(`Updating DBCluster ${logicalId}: ${physicalId}`);
     // go-to-k/cdkd#3994: a malformed desired Tags is refused before any call.
     refuseMalformedDesiredTags(properties['Tags'], resourceType, logicalId, physicalId);
+    // go-to-k/cdkd#5639: likewise a malformed AssociatedRoles, on every path.
+    const roles = this.desiredAssociatedRoles(
+      properties,
+      resourceType,
+      logicalId,
+      physicalId,
+      false
+    );
     // go-to-k/cdkd#5639: refused before any call when malformed; a removal
     // disables what the previous template declared, as CloudFormation does.
     const logExportConfig = logExportsDelta(
@@ -2135,8 +2603,87 @@ export class RDSProvider implements ResourceProvider {
       );
       skippedKeys.push(['PerformanceInsightsRetentionPeriod', usableRetentionPeriod]);
     }
+    // go-to-k/cdkd#5639: likewise the backtrack window and the write-forwarding
+    // flag, which would go out as NaN or read as "not true".
+    for (const [malformed, key, expected, usable] of [
+      [
+        backtrackWindowValue(properties['BacktrackWindow']) === 'malformed',
+        'BacktrackWindow',
+        'a whole number of seconds',
+        usableBacktrackWindow,
+      ],
+      [
+        localWriteForwardingFlag(properties['EnableLocalWriteForwarding']) === 'malformed',
+        'EnableLocalWriteForwarding',
+        'true or false',
+        usableLocalWriteForwarding,
+      ],
+    ] as const) {
+      if (!malformed) continue;
+      if (context?.replayingState !== true && context?.desiredFromAwsReadback !== true) {
+        throw markNonRetryable(
+          new ProvisioningError(
+            `${resourceType} ${logicalId}: ${key} must be ${expected}`,
+            resourceType,
+            logicalId,
+            physicalId
+          )
+        );
+      }
+      this.logger.warn(
+        safeMsg`DBCluster ${logicalId}: the replayed ${key} is not ${expected}; the setting is left as it is`
+      );
+      skippedKeys.push([key, usable]);
+    }
+    if (localWriteForwardingToSend(properties, previousProperties, context) === 'withheld') {
+      this.logger.warn(
+        safeMsg`DBCluster ${logicalId}: drift --revert does not turn local write forwarding (EnableLocalWriteForwarding) back on, because the template does not declare EnableLocalWriteForwarding: true; declare it and deploy, or turn it on with aws rds modify-db-cluster --enable-local-write-forwarding`
+      );
+      skippedKeys.push(['EnableLocalWriteForwarding', usableLocalWriteForwarding]);
+    }
 
     try {
+      // go-to-k/cdkd#5639: a changed EngineLifecycleSupport is refused before
+      // any change, as CloudFormation refuses it; its ProvisioningError passes
+      // through the catch.
+      const engineLifecycleSupport = await this.engineLifecycleSupportToSend(
+        'DB cluster',
+        logicalId,
+        physicalId,
+        resourceType,
+        properties,
+        previousProperties,
+        context
+      );
+      let authenticationType = masterUserAuthenticationTypeToSend(
+        properties,
+        previousProperties,
+        context
+      );
+      let passwordCompanion = passwordAuthenticationCompanion(
+        properties,
+        previousProperties,
+        authenticationType
+      );
+      // A rollback replay cannot fix the record: it reverts every other member
+      // and leaves the type as it is, with a warning.
+      if (passwordCompanion?.kind === 'missing' && context?.replayingState === true) {
+        this.logger.warn(
+          safeMsg`${logicalId}: the rollback leaves MasterUserAuthenticationType as it is, because the restored properties declare neither MasterUserPassword nor ManageMasterUserPassword: true, which RDS needs beside a switch to password`
+        );
+        authenticationType = undefined;
+        passwordCompanion = undefined;
+      }
+      if (passwordCompanion?.kind === 'missing') {
+        throw markNonRetryable(
+          new ProvisioningError(
+            passwordAuthenticationMissingText(resourceType, logicalId),
+            resourceType,
+            logicalId,
+            physicalId
+          )
+        );
+      }
       // Its own ProvisioningError names the cause; the catch passes it through.
       const vpcSgIds = await this.securityGroupsToSend(
         'DBCluster',
@@ -2170,6 +2717,12 @@ export class RDSProvider implements ResourceProvider {
         previousProperties,
         context
       );
+      // go-to-k/cdkd#5639 / #5640: the managed-password flag also rides a changed
+      // MasterUserAuthenticationType; the KMS key does not.
+      const sendManagedPasswordSetting = managedPasswordSettingRides(
+        sendCredentialSettings,
+        authenticationType
+      );
 
       // #1160 removal — ModifyDBCluster has merge semantics (an absent input
       // field means "no change"), so a property REMOVED from the template is
@@ -2186,7 +2739,9 @@ export class RDSProvider implements ResourceProvider {
       //     #2762 backfill members (`clusterModifyBackfillMembers`) and the
       //     #5639 scalars (`clusterModifyScalarMembers`).
       //   * TURNED OFF: a removed `EnableHttpEndpoint: true` disables the Data
-      //     API, as CloudFormation's handler does (`clusterHttpEndpointAction`).
+      //     API, as CloudFormation's handler does (`clusterHttpEndpointAction`),
+      //     and a removed `EnableLocalWriteForwarding: true` disables write
+      //     forwarding (`localWriteForwardingToSend`).
       // MasterUserSecret removed while the managed password stays on: the
       // credential gate re-sends ManageMasterUserPassword=true with no key, as
       // CloudFormation does, and the secret stays on its customer key
@@ -2211,6 +2766,7 @@ export class RDSProvider implements ResourceProvider {
         previousProperties,
         context
       );
+      const scalarMembers = clusterModifyScalarMembers(properties, previousProperties, context);
       await this.getClient().send(
         new ModifyDBClusterCommand({
           DBClusterIdentifier: physicalId,
@@ -2236,15 +2792,20 @@ export class RDSProvider implements ResourceProvider {
           ),
           ...(vpcSgIds !== undefined && { VpcSecurityGroupIds: vpcSgIds }),
           // #5153: only a changed password; any supplied one resets credentials.
-          MasterUserPassword: masterUserPasswordToSend(properties, previousProperties, context),
+          // go-to-k/cdkd#5639: a switch to password also carries the declared one.
+          MasterUserPassword:
+            masterUserPasswordToSend(properties, previousProperties, context) ??
+            (passwordCompanion?.kind === 'password' ? passwordCompanion.password : undefined),
           Port: portToSend,
           // #609 security-cluster backfill — all mutable via ModifyDBCluster.
-          ...(sendCredentialSettings &&
+          ...(sendManagedPasswordSetting &&
             properties['ManageMasterUserPassword'] !== undefined && {
               ManageMasterUserPassword: properties['ManageMasterUserPassword'] as boolean,
             }),
           ...(manageMasterUserPasswordOff && { ManageMasterUserPassword: false }),
-          ...(sendCredentialSettings &&
+          // go-to-k/cdkd#5639: also when a switch to password turns the
+          // managed secret on (`passwordAuthenticationCompanion`).
+          ...((sendCredentialSettings || passwordCompanion?.kind === 'managed') &&
             masterUserSecret?.KmsKeyId !== undefined && {
               MasterUserSecretKmsKeyId: masterUserSecret.KmsKeyId,
             }),
@@ -2265,8 +2826,17 @@ export class RDSProvider implements ResourceProvider {
           }),
           // go-to-k/cdkd#2762: only what changed; a removal keeps the live value.
           ...clusterModifyBackfillMembers(properties, previousProperties, context),
-          // go-to-k/cdkd#5639: only what changed; a removal keeps the live value.
-          ...clusterModifyScalarMembers(properties, previousProperties, context),
+          // go-to-k/cdkd#5639: only what changed; a removal keeps the live value,
+          // except a removed EnableLocalWriteForwarding: true, which turns it off.
+          ...scalarMembers,
+          // go-to-k/cdkd#5639: only a drift revert sends it; only a change
+          // sends the authentication type, beside the credential settings.
+          ...(engineLifecycleSupport !== undefined && {
+            EngineLifecycleSupport: engineLifecycleSupport,
+          }),
+          ...(authenticationType !== undefined && {
+            MasterUserAuthenticationType: authenticationType,
+          }),
           ...(logExportConfig !== undefined && {
             CloudwatchLogsExportConfiguration: logExportConfig,
           }),
@@ -2303,6 +2873,36 @@ export class RDSProvider implements ResourceProvider {
               cluster.PendingModifiedValues?.PendingCloudwatchLogsExports
             ),
           'CloudWatch Logs exports'
+        );
+      }
+
+      // go-to-k/cdkd#5639: CloudFormation's update stabilizes only once local
+      // write forwarding is no longer `enabling` / `disabling`
+      // (`BaseHandlerStd.isLocalWriteForwardingStabilized`).
+      const forwardingSent = scalarMembers.EnableLocalWriteForwarding;
+      if (!noWait && forwardingSent !== undefined) {
+        await this.waitForClusterState(
+          logicalId,
+          physicalId,
+          (cluster) => localWriteForwardingApplied(cluster, forwardingSent),
+          'local write forwarding setting'
+        );
+      }
+
+      // go-to-k/cdkd#5639: RDS applies a changed BacktrackWindow after
+      // ModifyDBCluster returns (measured: a describe right after the call
+      // still read the old window), and it is not among the pending modified
+      // values. CloudFormation reports the update only once the cluster has
+      // stabilized (`BaseHandlerStd.isDBClusterStabilized`), so wait for the
+      // window sent; a describe that never reports one ends the wait.
+      const backtrackSent = scalarMembers.BacktrackWindow;
+      if (!noWait && backtrackSent !== undefined) {
+        await this.waitForClusterState(
+          logicalId,
+          physicalId,
+          (cluster) =>
+            cluster.BacktrackWindow === undefined || cluster.BacktrackWindow === backtrackSent,
+          'backtrack window'
         );
       }
 
@@ -2371,6 +2971,19 @@ export class RDSProvider implements ResourceProvider {
           }
         }
       }
+
+      // go-to-k/cdkd#5639: after the ModifyDBCluster, as CloudFormation's
+      // update handler changes them. A malformed record only misses detaches:
+      // the plan reads what is live, so an attached role is not attached twice.
+      await this.applyAssociatedRoles(
+        'cluster',
+        logicalId,
+        physicalId,
+        roles,
+        associatedRoleList(previousProperties['AssociatedRoles']) ?? [],
+        context?.maskSecrets,
+        context
+      );
 
       // Apply tag diff using the cluster ARN.
       if (described?.DBClusterArn) {
@@ -2452,14 +3065,30 @@ export class RDSProvider implements ResourceProvider {
           notFoundFault: 'DBClusterNotFoundFault',
           isNotFound: (error) => this.isNotFoundError(error, 'DBClusterNotFoundFault'),
         }),
+        // go-to-k/cdkd#5639: the flip succeeds in the window a busy cluster
+        // opens, so the re-enable waits that window out too, within the same
+        // bounded budget, rather than leaving the guard off on one refusal.
         reEnable: async () => {
-          await this.getClient().send(
-            new ModifyDBClusterCommand({
-              DBClusterIdentifier: physicalId,
-              DeletionProtection: true,
-              ApplyImmediately: true,
-            })
-          );
+          await modifyDbInstanceWhenAvailable({
+            send: () =>
+              this.getClient().send(
+                new ModifyDBClusterCommand({
+                  DBClusterIdentifier: physicalId,
+                  DeletionProtection: true,
+                  ApplyImmediately: true,
+                })
+              ),
+            readStatus: async () => (await this.describeDBCluster(physicalId))?.Status,
+            sleep: (ms) => this.sleep(ms),
+            logger: this.logger,
+            label: 'RDS DBCluster',
+            subject: 'cluster',
+            isRefusal: isClusterBusyRefusal,
+            logicalId,
+            remainingMs: enclosingDeadlineRemainingMs(),
+            maxWaitMs: PROTECTION_FLIP_RETRY_WAIT_MS,
+            command: 'destroy',
+          });
         },
       },
     });
@@ -2499,14 +3128,30 @@ export class RDSProvider implements ResourceProvider {
             guardName: 'DeletionProtection',
             observe: async () =>
               (await this.describeDBCluster(physicalId))?.DeletionProtection === true,
+            // go-to-k/cdkd#5639: RDS refuses the flip while the cluster is
+            // busy (a member still taking its settings); wait that out and
+            // resend, within a bounded budget.
             disable: async () => {
-              await this.getClient().send(
-                new ModifyDBClusterCommand({
-                  DBClusterIdentifier: physicalId,
-                  DeletionProtection: false,
-                  ApplyImmediately: true,
-                })
-              );
+              await modifyDbInstanceWhenAvailable({
+                send: () =>
+                  this.getClient().send(
+                    new ModifyDBClusterCommand({
+                      DBClusterIdentifier: physicalId,
+                      DeletionProtection: false,
+                      ApplyImmediately: true,
+                    })
+                  ),
+                readStatus: async () => (await this.describeDBCluster(physicalId))?.Status,
+                sleep: (ms) => this.sleep(ms),
+                logger: this.logger,
+                label: 'RDS DBCluster',
+                subject: 'cluster',
+                isRefusal: isClusterBusyRefusal,
+                logicalId,
+                remainingMs: enclosingDeadlineRemainingMs(),
+                maxWaitMs: PROTECTION_FLIP_RETRY_WAIT_MS,
+                command: 'destroy',
+              });
             },
           });
           this.logger.debug(`Disabled DeletionProtection on DBCluster ${logicalId} before delete`);
@@ -2642,11 +3287,20 @@ export class RDSProvider implements ResourceProvider {
     logicalId: string,
     resourceType: string,
     properties: Record<string, unknown>,
-    mask: ((text: string) => string) | undefined
+    mask: ((text: string) => string) | undefined,
+    replaying = false
   ): Promise<ResourceCreateResult> {
     this.logger.debug(`Creating DBInstance ${logicalId}`);
     // go-to-k/cdkd#3994: a malformed Tags is refused before any call.
     const tags = refuseMalformedDesiredTags(properties['Tags'], resourceType, logicalId);
+    // go-to-k/cdkd#5640: likewise a malformed AssociatedRoles.
+    const roles = this.desiredAssociatedRoles(
+      properties,
+      resourceType,
+      logicalId,
+      undefined,
+      replaying
+    );
     const logExports = desiredLogExports(properties, resourceType, logicalId);
 
     const dbInstanceIdentifier =
@@ -2804,6 +3458,15 @@ export class RDSProvider implements ResourceProvider {
           ...(properties['DedicatedLogVolume'] != null && {
             DedicatedLogVolume: properties['DedicatedLogVolume'] as boolean,
           }),
+          // go-to-k/cdkd#5640: as CloudFormation's create translation sends them.
+          ...(engineLifecycleSupportOf(properties) !== undefined && {
+            EngineLifecycleSupport: engineLifecycleSupportOf(properties),
+          }),
+          ...(properties['MasterUserAuthenticationType'] != null && {
+            MasterUserAuthenticationType: properties[
+              'MasterUserAuthenticationType'
+            ] as CreateDBInstanceCommandInput['MasterUserAuthenticationType'],
+          }),
           // The group applies at create, so no reboot follows, as under
           // CloudFormation's create handler.
           ...(properties['DBParameterGroupName'] != null && {
@@ -2839,6 +3502,26 @@ export class RDSProvider implements ResourceProvider {
         await this.waitForInstanceAvailable(logicalId, dbInstanceIdentifier);
       }
 
+      // go-to-k/cdkd#5640: once the instance is available, as CloudFormation's
+      // create handler attaches them (`updateAssociatedRoles`). A role's
+      // failure is not this instance name's collision (#3826).
+      if (roles !== 'skipped') {
+        try {
+          await this.applyAssociatedRoles(
+            'instance',
+            logicalId,
+            dbInstanceIdentifier,
+            roles,
+            [],
+            mask,
+            undefined
+          );
+        } catch (roleError) {
+          markAuxiliaryFailure(roleError, logicalId);
+          throw roleError;
+        }
+      }
+
       // Describe to get final attributes
       const described = await this.describeDBInstance(dbInstanceIdentifier);
 
@@ -2848,6 +3531,12 @@ export class RDSProvider implements ResourceProvider {
           'Endpoint.Address': described?.Endpoint?.Address,
           'Endpoint.Port': stringifyIfAssigned(described?.Endpoint?.Port),
           Arn: described?.DBInstanceArn,
+        }),
+        // A replayed create that attached no role records none.
+        ...(roles === 'skipped' && {
+          effectiveProperties: Object.fromEntries(
+            Object.entries(properties).filter(([key]) => key !== 'AssociatedRoles')
+          ),
         }),
       };
     } catch (error) {
@@ -2892,6 +3581,14 @@ export class RDSProvider implements ResourceProvider {
     this.logger.debug(`Updating DBInstance ${logicalId}: ${physicalId}`);
     // go-to-k/cdkd#3994: a malformed desired Tags is refused before any call.
     refuseMalformedDesiredTags(properties['Tags'], resourceType, logicalId, physicalId);
+    // go-to-k/cdkd#5640: likewise a malformed AssociatedRoles, on every path.
+    const roles = this.desiredAssociatedRoles(
+      properties,
+      resourceType,
+      logicalId,
+      physicalId,
+      false
+    );
     // go-to-k/cdkd#5640: refused before any call when malformed; a removal
     // disables what the previous template declared, as CloudFormation does.
     const logExportConfig = logExportsDelta(
@@ -2909,6 +3606,47 @@ export class RDSProvider implements ResourceProvider {
       previousProperties,
       context
     );
+    // go-to-k/cdkd#5640: likewise outside the try. A changed
+    // EngineLifecycleSupport is refused before any change, as CloudFormation
+    // refuses it.
+    const engineLifecycleSupport = await this.engineLifecycleSupportToSend(
+      'DB instance',
+      logicalId,
+      physicalId,
+      resourceType,
+      properties,
+      previousProperties,
+      context
+    );
+    let authenticationType = masterUserAuthenticationTypeToSend(
+      properties,
+      previousProperties,
+      context
+    );
+    let passwordCompanion = passwordAuthenticationCompanion(
+      properties,
+      previousProperties,
+      authenticationType
+    );
+    // A rollback replay cannot fix the record: it reverts every other member
+    // and leaves the type as it is, with a warning.
+    if (passwordCompanion?.kind === 'missing' && context?.replayingState === true) {
+      this.logger.warn(
+        safeMsg`${logicalId}: the rollback leaves MasterUserAuthenticationType as it is, because the restored properties declare neither MasterUserPassword nor ManageMasterUserPassword: true, which RDS needs beside a switch to password`
+      );
+      authenticationType = undefined;
+      passwordCompanion = undefined;
+    }
+    if (passwordCompanion?.kind === 'missing') {
+      throw markNonRetryable(
+        new ProvisioningError(
+          passwordAuthenticationMissingText(resourceType, logicalId),
+          resourceType,
+          logicalId,
+          physicalId
+        )
+      );
+    }
 
     try {
       // go-to-k/cdkd#5640: a zone ModifyDBInstance cannot apply is refused
@@ -3039,7 +3777,16 @@ export class RDSProvider implements ResourceProvider {
         previousProperties,
         context
       );
-      const instancePassword = masterUserPasswordToSend(properties, previousProperties, context);
+      // go-to-k/cdkd#5639 / #5640: the managed-password flag also rides a changed
+      // MasterUserAuthenticationType; the KMS key does not.
+      const sendManagedPasswordSetting = managedPasswordSettingRides(
+        sendCredentialSettings,
+        authenticationType
+      );
+      // go-to-k/cdkd#5640: a switch to password also carries the declared one.
+      const instancePassword =
+        masterUserPasswordToSend(properties, previousProperties, context) ??
+        (passwordCompanion?.kind === 'password' ? passwordCompanion.password : undefined);
       // #1160 removal — ModifyDBInstance has merge semantics (an absent input
       // field means "no change"), so a property REMOVED from the template is
       // sent as its CFn reset value only where CloudFormation resets it, per
@@ -3121,11 +3868,13 @@ export class RDSProvider implements ResourceProvider {
               // key is immutable post-create; a template change replaces the
               // instance, which cdkd's diff layer schedules independently — same
               // treatment as StorageEncrypted / MasterUsername above).
-              ...(sendCredentialSettings &&
+              // go-to-k/cdkd#5640: also when a switch to password turns the
+              // managed secret on (`passwordAuthenticationCompanion`).
+              ...((sendCredentialSettings || passwordCompanion?.kind === 'managed') &&
                 masterUserSecret?.KmsKeyId !== undefined && {
                   MasterUserSecretKmsKeyId: masterUserSecret.KmsKeyId,
                 }),
-              ...(sendCredentialSettings &&
+              ...(sendManagedPasswordSetting &&
                 properties['ManageMasterUserPassword'] !== undefined && {
                   ManageMasterUserPassword: properties['ManageMasterUserPassword'] as boolean,
                 }),
@@ -3143,6 +3892,14 @@ export class RDSProvider implements ResourceProvider {
                 | undefined,
               ...(logExportConfig !== undefined && {
                 CloudwatchLogsExportConfiguration: logExportConfig,
+              }),
+              // go-to-k/cdkd#5640: only a drift revert sends it; only a change
+              // sends the authentication type, beside the credential settings.
+              ...(engineLifecycleSupport !== undefined && {
+                EngineLifecycleSupport: engineLifecycleSupport,
+              }),
+              ...(authenticationType !== undefined && {
+                MasterUserAuthenticationType: authenticationType,
               }),
             })
           ),
@@ -3193,6 +3950,21 @@ export class RDSProvider implements ResourceProvider {
           String(properties['CertificateRotationRestart']) === 'true'
         );
       }
+
+      // go-to-k/cdkd#5640: after the ModifyDBInstance and its reboot, as
+      // CloudFormation's update handler changes them. A malformed record only
+      // misses detaches: the plan reads what is live.
+      await this.applyAssociatedRoles(
+        'instance',
+        logicalId,
+        physicalId,
+        roles,
+        associatedRoleList(previousProperties['AssociatedRoles'], {
+          featureNameRequired: true,
+        }) ?? [],
+        context?.maskSecrets,
+        context
+      );
 
       // Apply tag diff using the instance ARN.
       if (described?.DBInstanceArn) {
@@ -3261,14 +4033,26 @@ export class RDSProvider implements ResourceProvider {
           notFoundFault: 'DBInstanceNotFoundFault',
           isNotFound: (error) => this.isNotFoundError(error, 'DBInstanceNotFoundFault'),
         }),
+        // go-to-k/cdkd#5639: as for a DB cluster.
         reEnable: async () => {
-          await this.getClient().send(
-            new ModifyDBInstanceCommand({
-              DBInstanceIdentifier: physicalId,
-              DeletionProtection: true,
-              ApplyImmediately: true,
-            })
-          );
+          await modifyDbInstanceWhenAvailable({
+            send: () =>
+              this.getClient().send(
+                new ModifyDBInstanceCommand({
+                  DBInstanceIdentifier: physicalId,
+                  DeletionProtection: true,
+                  ApplyImmediately: true,
+                })
+              ),
+            readStatus: async () => (await this.describeDBInstance(physicalId))?.DBInstanceStatus,
+            sleep: (ms) => this.sleep(ms),
+            logger: this.logger,
+            label: 'RDS DBInstance',
+            logicalId,
+            remainingMs: enclosingDeadlineRemainingMs(),
+            maxWaitMs: PROTECTION_FLIP_RETRY_WAIT_MS,
+            command: 'destroy',
+          });
         },
       },
     });
@@ -3301,14 +4085,28 @@ export class RDSProvider implements ResourceProvider {
             guardName: 'DeletionProtection',
             observe: async () =>
               (await this.describeDBInstance(physicalId))?.DeletionProtection === true,
+            // go-to-k/cdkd#5639: as for a DB cluster, a refusal of the flip
+            // as not `available` is waited out and resent.
             disable: async () => {
-              await this.getClient().send(
-                new ModifyDBInstanceCommand({
-                  DBInstanceIdentifier: physicalId,
-                  DeletionProtection: false,
-                  ApplyImmediately: true,
-                })
-              );
+              await modifyDbInstanceWhenAvailable({
+                send: () =>
+                  this.getClient().send(
+                    new ModifyDBInstanceCommand({
+                      DBInstanceIdentifier: physicalId,
+                      DeletionProtection: false,
+                      ApplyImmediately: true,
+                    })
+                  ),
+                readStatus: async () =>
+                  (await this.describeDBInstance(physicalId))?.DBInstanceStatus,
+                sleep: (ms) => this.sleep(ms),
+                logger: this.logger,
+                label: 'RDS DBInstance',
+                logicalId,
+                remainingMs: enclosingDeadlineRemainingMs(),
+                maxWaitMs: PROTECTION_FLIP_RETRY_WAIT_MS,
+                command: 'destroy',
+              });
             },
           });
           this.logger.debug(`Disabled DeletionProtection on DBInstance ${logicalId} before delete`);
@@ -3653,6 +4451,79 @@ export class RDSProvider implements ResourceProvider {
       }
       await backOff();
     }
+  }
+
+  /**
+   * go-to-k/cdkd#5639 / #5640: the `EngineLifecycleSupport` an update sends
+   * (`engineLifecycleSupportAction`), or `undefined` for none; a change
+   * CloudFormation refuses throws before any call. The physical id can be
+   * secret-derived, so the refusal is masked against the recorded name too
+   * (go-to-k/cdkd#4339).
+   */
+  private async engineLifecycleSupportToSend(
+    kind: 'DB cluster' | 'DB instance',
+    logicalId: string,
+    physicalId: string,
+    resourceType: string,
+    properties: Record<string, unknown>,
+    previousProperties: Record<string, unknown>,
+    context: UpdateContext | undefined
+  ): Promise<string | undefined> {
+    const action = engineLifecycleSupportAction(properties, previousProperties, context);
+    if (action === 'unchanged') return undefined;
+    const desired = engineLifecycleSupportOf(properties);
+    if (action === 'send') return desired;
+    const idKey = kind === 'DB cluster' ? 'DBClusterIdentifier' : 'DBInstanceIdentifier';
+    const { mask } = withDerivedNameMasks(
+      this.logger,
+      createMaskedLogSinks(this.logger, context?.maskSecrets),
+      [[previousProperties[idKey], physicalId]]
+    );
+    // `undefined` once the live resource is known to hold the declared value.
+    let liveRead: 'read' | 'not-found' | undefined = 'read';
+    if (action === 'check-live') {
+      try {
+        const resource =
+          kind === 'DB cluster'
+            ? await this.describeDBCluster(physicalId)
+            : await this.describeDBInstance(physicalId);
+        if (resource === undefined) liveRead = 'not-found';
+        else if (resource.EngineLifecycleSupport === desired) liveRead = undefined;
+      } catch (err) {
+        if (err instanceof CdkdError) throw err;
+        // Only the fault NAME proves the resource is gone (go-to-k/cdkd#4283).
+        const faultName = (err as { name?: unknown } | null)?.name;
+        if (faultName === 'DBClusterNotFoundFault' || faultName === 'DBInstanceNotFoundFault') {
+          liveRead = 'not-found';
+        } else {
+          // Left retryable: a later read may succeed. AWS's text reaches the
+          // message as its class only, the rest at debug (go-to-k/cdkd#2319).
+          throw this.wrapCaughtError(
+            mask,
+            err,
+            (text) =>
+              new ProvisioningError(
+                `${mask(engineLifecycleSupportRefusalText(resourceType, logicalId, physicalId, kind, 'unreadable'))} The read failed: ${text}`,
+                resourceType,
+                logicalId,
+                physicalId,
+                err instanceof Error ? err : undefined
+              )
+          );
+        }
+      }
+    }
+    if (liveRead === undefined) return undefined;
+    throw markNonRetryable(
+      new ProvisioningError(
+        mask(
+          engineLifecycleSupportRefusalText(resourceType, logicalId, physicalId, kind, liveRead)
+        ),
+        resourceType,
+        logicalId,
+        physicalId
+      )
+    );
   }
 
   private async describeDBCluster(dbClusterIdentifier: string) {
@@ -4050,6 +4921,206 @@ export class RDSProvider implements ResourceProvider {
   }
 
   /**
+   * go-to-k/cdkd#5639 / #5640: the template's `AssociatedRoles`, refused
+   * before any call when malformed. Its gap to the record is what gets
+   * DETACHED, so a malformed list never reads as empty, on an update replayed
+   * from state too (`.claude/rules/provider-aws-response-reads.md`, the list
+   * rule). A DB instance's entry needs a `FeatureName`: its schema requires
+   * one, and AddRoleToDBInstance cannot be sent without it. Only a rollback's
+   * re-create, which detaches nothing, warns and attaches none instead
+   * (`'skipped'`).
+   */
+  private desiredAssociatedRoles(
+    properties: Record<string, unknown>,
+    resourceType: string,
+    logicalId: string,
+    physicalId: string | undefined,
+    replayingCreate: false
+  ): AssociatedRole[];
+  private desiredAssociatedRoles(
+    properties: Record<string, unknown>,
+    resourceType: string,
+    logicalId: string,
+    physicalId: string | undefined,
+    replayingCreate: boolean
+  ): AssociatedRole[] | 'skipped';
+  private desiredAssociatedRoles(
+    properties: Record<string, unknown>,
+    resourceType: string,
+    logicalId: string,
+    physicalId: string | undefined,
+    replayingCreate: boolean
+  ): AssociatedRole[] | 'skipped' {
+    const instance = resourceType === 'AWS::RDS::DBInstance';
+    const roles = associatedRoleList(properties['AssociatedRoles'], {
+      featureNameRequired: instance,
+    });
+    if (roles !== undefined) return roles;
+    const expected = instance
+      ? 'a list of objects with a RoleArn and a FeatureName'
+      : 'a list of objects with a RoleArn';
+    if (!replayingCreate) {
+      throw markNonRetryable(
+        new ProvisioningError(
+          `${resourceType} ${logicalId}: AssociatedRoles must be ${expected}; nothing was changed`,
+          resourceType,
+          logicalId,
+          physicalId
+        )
+      );
+    }
+    this.logger.warn(
+      safeMsg`${logicalId} (${resourceType}): the replayed AssociatedRoles is not ${expected}, so no role is attached`
+    );
+    return 'skipped';
+  }
+
+  /**
+   * go-to-k/cdkd#5639 / #5640: attach the `desired` roles `previous` lacks and
+   * detach the `previous` ones `desired` dropped, removals first, as
+   * CloudFormation's handlers do (`updateAssociatedRoles`). RDS takes neither
+   * call while the cluster or instance is busy, so they wait for `available`
+   * first, under `--no-wait` too, and a call refused as busy waits it out and
+   * is resent (#5194's rule). The live list is read once `available`, and the
+   * plan drops what AWS already holds or no longer holds
+   * (`planAssociatedRoleChanges`); a Describe answering no resource changes
+   * nothing. CloudFormation's handlers stabilize each call once the Describe
+   * lists the attached association, whatever its `Status` (`PENDING`
+   * included: `isAssociatedRoleAttached` /
+   * `isDBInstanceRoleAdditionStabilized` match the role and feature only), or
+   * no longer lists the detached one; so does the wait here, which
+   * `--no-wait` skips. CloudFormation's instance removal predicate
+   * (`isDBInstanceRoleRemovalStabilized`) matches the RoleArn alone; cdkd
+   * matches the role and the feature, so the same role kept for another
+   * feature does not hold the wait open. A detach is marked attempted too, for
+   * `associatedRolesNamed`.
+   */
+  private async applyAssociatedRoles(
+    target: 'cluster' | 'instance',
+    logicalId: string,
+    physicalId: string,
+    desired: readonly AssociatedRole[],
+    previous: readonly AssociatedRole[],
+    mask: ((text: string) => string) | undefined,
+    marks: Pick<UpdateContext, 'markUnsettled' | 'markAttempted'> | undefined
+  ): Promise<void> {
+    const candidates = planAssociatedRoleChanges(desired, previous);
+    if (candidates.toAdd.length === 0 && candidates.toRemove.length === 0) return;
+    const label = target === 'cluster' ? 'RDS DBCluster' : 'RDS DBInstance';
+    // Bounded by the resource deadline, which does not cancel this operation:
+    // a wait that outlives it would attach after the engine gave up.
+    const waitBudgetMs = Math.min(1_800_000, enclosingDeadlineRemainingMs() - 30_000);
+    if (waitBudgetMs <= 0) {
+      throw new Error(
+        `the resource timeout leaves no more time to change the roles of the ${target}; re-run the deploy, or with a longer --resource-timeout`
+      );
+    }
+    if (target === 'cluster') {
+      await this.waitForClusterAvailable(logicalId, physicalId, waitBudgetMs, 'changing its roles');
+    } else {
+      await this.waitForInstanceAvailable(
+        logicalId,
+        physicalId,
+        waitBudgetMs,
+        'changing its roles'
+      );
+    }
+    const resource =
+      target === 'cluster'
+        ? await this.describeDBCluster(physicalId)
+        : await this.describeDBInstance(physicalId);
+    if (resource === undefined) {
+      throw new Error(
+        `Describe returned no ${target} while planning its role changes; no role was attached or detached`
+      );
+    }
+    const { toAdd, toRemove } = planAssociatedRoleChanges(
+      desired,
+      previous,
+      resource.AssociatedRoles ?? []
+    );
+    if (toAdd.length === 0 && toRemove.length === 0) return;
+    marks?.markUnsettled?.('AssociatedRoles');
+    const readStatus =
+      target === 'cluster'
+        ? async () => (await this.describeDBCluster(physicalId))?.Status
+        : async () => (await this.describeDBInstance(physicalId))?.DBInstanceStatus;
+    const whenAvailable = (send: () => Promise<unknown>): Promise<void> =>
+      modifyDbInstanceWhenAvailable({
+        send,
+        readStatus,
+        sleep: (ms) => this.sleep(ms),
+        logger: this.logger,
+        label,
+        subject: target,
+        isRefusal: (error) =>
+          isRoleCallNotAvailableRefusal(error) || isModifyNotAvailableRefusal(error),
+        logicalId,
+        remainingMs: enclosingDeadlineRemainingMs(),
+      });
+    for (const role of toRemove) {
+      // A detach is an attempt too, so `associatedRolesNamed` never reads a
+      // role this run detached as detached outside cdkd. Marked BEFORE the
+      // call, unlike an attach (#5498): a detach AWS applied can still throw
+      // (a lost response, a replay's not-found), and the mark only matters
+      // for a role AWS no longer lists, so a detach that did nothing is inert.
+      marks?.markAttempted?.('AssociatedRoles', [associatedRoleKey(role)]);
+      await whenAvailable(() =>
+        target === 'cluster'
+          ? this.getClient().send(
+              new RemoveRoleFromDBClusterCommand({ DBClusterIdentifier: physicalId, ...role })
+            )
+          : this.getClient().send(
+              new RemoveRoleFromDBInstanceCommand({
+                DBInstanceIdentifier: physicalId,
+                RoleArn: role.RoleArn,
+                FeatureName: role.FeatureName,
+              })
+            )
+      );
+    }
+    for (const role of toAdd) {
+      await whenAvailable(() =>
+        target === 'cluster'
+          ? this.getClient().send(
+              new AddRoleToDBClusterCommand({ DBClusterIdentifier: physicalId, ...role })
+            )
+          : this.getClient().send(
+              new AddRoleToDBInstanceCommand({
+                DBInstanceIdentifier: physicalId,
+                RoleArn: role.RoleArn,
+                FeatureName: role.FeatureName,
+              })
+            )
+      );
+      marks?.markAttempted?.('AssociatedRoles', [associatedRoleKey(role)]);
+    }
+    if (process.env['CDKD_NO_WAIT'] === 'true') return;
+    const attached = toAdd.map(associatedRoleKey);
+    const detached = toRemove.map(associatedRoleKey);
+    const settled = (roles: readonly LiveAssociatedRole[] | undefined): boolean => {
+      const held = new Set((roles ?? []).map(associatedRoleKey));
+      return attached.every((key) => held.has(key)) && detached.every((key) => !held.has(key));
+    };
+    const change = `IAM role associations (${maskerOrIdentity(mask)(associatedRoleArns([...attached, ...detached]))})`;
+    if (target === 'cluster') {
+      await this.waitForClusterState(
+        logicalId,
+        physicalId,
+        (cluster) => settled(cluster.AssociatedRoles),
+        change
+      );
+    } else {
+      await this.waitForInstanceState(
+        logicalId,
+        physicalId,
+        (instance) => settled(instance.AssociatedRoles),
+        change
+      );
+    }
+  }
+
+  /**
    * Wait for a DBCluster to become available. A terminal status
    * (`isTerminalDbWaitStatus`) fails at once rather than after the
    * 30-minute budget (issue #5426).
@@ -4057,7 +5128,8 @@ export class RDSProvider implements ResourceProvider {
   private async waitForClusterAvailable(
     logicalId: string,
     dbClusterIdentifier: string,
-    maxWaitMs = 1_800_000
+    maxWaitMs = 1_800_000,
+    doing = 'being created'
   ): Promise<void> {
     const startTime = Date.now();
     let delay = 5_000;
@@ -4072,7 +5144,7 @@ export class RDSProvider implements ResourceProvider {
       // Issue #5426: a terminal status never becomes 'available'.
       if (isTerminalDbWaitStatus(status)) {
         throw new Error(
-          safeMsg`DBCluster ${logicalId} entered status ${status ?? ''} while being created, which it does not leave on its own`
+          safeMsg`DBCluster ${logicalId} entered status ${status ?? ''} while ${doing}, which it does not leave on its own`
         );
       }
 
@@ -4201,7 +5273,8 @@ export class RDSProvider implements ResourceProvider {
   private async waitForInstanceAvailable(
     logicalId: string,
     dbInstanceIdentifier: string,
-    maxWaitMs = 1_800_000
+    maxWaitMs = 1_800_000,
+    doing = 'being created'
   ): Promise<void> {
     const startTime = Date.now();
     let delay = 10_000;
@@ -4216,7 +5289,7 @@ export class RDSProvider implements ResourceProvider {
       // Issue #5426: a terminal status never becomes 'available'.
       if (isTerminalDbWaitStatus(status)) {
         throw new Error(
-          safeMsg`DBInstance ${logicalId} entered status ${status ?? ''} while being created, which it does not leave on its own`
+          safeMsg`DBInstance ${logicalId} entered status ${status ?? ''} while ${doing}, which it does not leave on its own`
         );
       }
 
@@ -4289,11 +5362,12 @@ export class RDSProvider implements ResourceProvider {
 
   /**
    * go-to-k/cdkd#5639 / #5640: RDS answers the exported log types in its own
-   * order, and the template's order means nothing to it.
+   * order, and the template's order means nothing to it; likewise the
+   * associated IAM roles. Also what `unsettledAfterUpdate` compares by.
    */
   getDriftUnorderedPaths(resourceType: string): string[] {
     return resourceType === 'AWS::RDS::DBCluster' || resourceType === 'AWS::RDS::DBInstance'
-      ? ['EnableCloudwatchLogsExports']
+      ? ['EnableCloudwatchLogsExports', 'AssociatedRoles']
       : [];
   }
 
@@ -4331,27 +5405,78 @@ export class RDSProvider implements ResourceProvider {
    * from the recorded `properties` (no `observedProperties`) the two would
    * read as drift; both sides fold to the readback's type. Anything else is
    * left as it is.
+   *
+   * go-to-k/cdkd#5639 / #5640: on both types, `AssociatedRoles` folds a
+   * repeated entry and an empty `FeatureName`, which AWS never holds
+   * (`canonicalAssociatedRoles`).
    */
   canonicalizeDriftProperties(
     resourceType: string,
     properties: Record<string, unknown>
   ): Record<string, unknown> {
-    if (resourceType !== 'AWS::RDS::DBCluster') return properties;
+    if (resourceType !== 'AWS::RDS::DBCluster' && resourceType !== 'AWS::RDS::DBInstance') {
+      return properties;
+    }
     let out: Record<string, unknown> | undefined;
     const set = (key: string, value: unknown): void => {
       out ??= { ...properties };
       out[key] = value;
     };
+    if (Array.isArray(properties['AssociatedRoles'])) {
+      set('AssociatedRoles', canonicalAssociatedRoles(properties['AssociatedRoles']));
+    }
+    if (resourceType !== 'AWS::RDS::DBCluster') return out ?? properties;
     for (const key of CLUSTER_BOOLEAN_SCALARS) {
       const value = properties[key];
       if (value === 'true' || value === 'false') set(key, value === 'true');
     }
-    const retention = properties['PerformanceInsightsRetentionPeriod'];
-    if (typeof retention === 'string') {
-      const parsed = retentionPeriodValue(retention);
-      if (typeof parsed === 'number') set('PerformanceInsightsRetentionPeriod', parsed);
+    for (const key of ['PerformanceInsightsRetentionPeriod', 'BacktrackWindow']) {
+      const value = properties[key];
+      if (typeof value === 'string') {
+        const parsed = retentionPeriodValue(value);
+        if (typeof parsed === 'number') set(key, parsed);
+      }
     }
     return out ?? properties;
+  }
+
+  /** The post-update proof (#5380) compares through the same normalization. */
+  canonicalizeUnsettledProperties(
+    resourceType: string,
+    properties: Record<string, unknown>
+  ): Record<string, unknown> {
+    return this.canonicalizeDriftProperties(resourceType, properties);
+  }
+
+  /**
+   * go-to-k/cdkd#5487: the live values of a record's unsettled names. Only
+   * `AssociatedRoles` is ever marked (`applyAssociatedRoles`), and it keeps
+   * only the associations the record, the template or an earlier attempt
+   * (#5498) names: the convergence puts this on the previous side, so a role
+   * an out-of-band change attached would otherwise read as dropped by the
+   * template, and be detached.
+   */
+  async readUnsettled(
+    physicalId: string,
+    logicalId: string,
+    resourceType: string,
+    names: ReadonlySet<string>,
+    recordedProperties?: Record<string, unknown>,
+    desiredProperties?: Record<string, unknown>,
+    attemptedItems?: ReadonlyMap<string, ReadonlySet<string>>
+  ): Promise<Record<string, unknown> | ResourceNotFound | undefined> {
+    const live = await this.readCurrentState(physicalId, logicalId, resourceType);
+    if (live === undefined || live === RESOURCE_NOT_FOUND) return live;
+    if (!names.has('AssociatedRoles')) return live;
+    return {
+      ...live,
+      AssociatedRoles: associatedRolesNamed(
+        live['AssociatedRoles'],
+        recordedProperties?.['AssociatedRoles'],
+        desiredProperties?.['AssociatedRoles'],
+        attemptedItems?.get('AssociatedRoles')
+      ),
+    };
   }
 
   /**
@@ -4657,6 +5782,16 @@ export class RDSProvider implements ResourceProvider {
     if (inst.AvailabilityZone !== undefined && inst.MultiAZ !== true) {
       result['AvailabilityZone'] = inst.AvailabilityZone;
     }
+    // go-to-k/cdkd#5640: same name on the Describe shape. Not for a cluster
+    // member, whose lifecycle the CLUSTER owns (the member reports the
+    // cluster's). `MasterUserAuthenticationType` is write-only in the registry
+    // schema and absent from DescribeDBInstances, so it is not read back.
+    if (inst.EngineLifecycleSupport !== undefined && inst.DBClusterIdentifier === undefined) {
+      result['EngineLifecycleSupport'] = inst.EngineLifecycleSupport;
+    }
+    // go-to-k/cdkd#5640: always a list, so a role lost out of band reads as a
+    // change against the recorded list (`Status` is not a template member).
+    result['AssociatedRoles'] = associatedRolesReadback(inst.AssociatedRoles);
     if (inst.DBInstanceArn) await this.attachTags(result, inst.DBInstanceArn);
     return result;
   }
@@ -4799,6 +5934,30 @@ export class RDSProvider implements ResourceProvider {
     if (cluster.HttpEndpointEnabled !== undefined) {
       result['EnableHttpEndpoint'] = cluster.HttpEndpointEnabled;
     }
+    // go-to-k/cdkd#5639: same names on the Describe shape.
+    // `MasterUserAuthenticationType` is write-only in the registry schema and
+    // absent from DescribeDBClusters, so it is not read back.
+    if (cluster.DatabaseInsightsMode !== undefined) {
+      result['DatabaseInsightsMode'] = cluster.DatabaseInsightsMode;
+    }
+    if (cluster.EngineLifecycleSupport !== undefined) {
+      result['EngineLifecycleSupport'] = cluster.EngineLifecycleSupport;
+    }
+    // go-to-k/cdkd#5639. `ClusterScalabilityType` is not read back: the
+    // registry schema lists it write-only, and a recorded create-only value
+    // the template never declared would read as a removal.
+    if (cluster.BacktrackWindow !== undefined) {
+      result['BacktrackWindow'] = cluster.BacktrackWindow;
+    }
+    // `requested` and `enabled` read as on, as CloudFormation's read handler
+    // projects the status (`Translator.translateLocalWriteForwardingStatus`).
+    if (cluster.LocalWriteForwardingStatus !== undefined) {
+      result['EnableLocalWriteForwarding'] =
+        cluster.LocalWriteForwardingStatus === 'requested' ||
+        cluster.LocalWriteForwardingStatus === 'enabled';
+    }
+    // go-to-k/cdkd#5639: as for a DB instance.
+    result['AssociatedRoles'] = associatedRolesReadback(cluster.AssociatedRoles);
     if (cluster.DBClusterArn) await this.attachTags(result, cluster.DBClusterArn);
     return result;
   }

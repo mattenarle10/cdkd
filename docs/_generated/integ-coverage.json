@@ -1189,6 +1189,7 @@
         "dynamodb-globaltable-implied-stream",
         "dynamodb-globaltable-replica-settings",
         "globaltable-fix-forward-orphan",
+        "globaltable-template-baseline-drift",
         "lambda",
         "rollback-replay-effective-props"
       ],
@@ -1208,6 +1209,10 @@
         ],
         "globaltable-fix-forward-orphan": [
           "l1"
+        ],
+        "globaltable-template-baseline-drift": [
+          "l1",
+          "literal"
         ],
         "lambda": [
           "l2",
@@ -2860,6 +2865,7 @@
         "ec2-instance",
         "ec2-instance-fanout",
         "ec2-route-targets",
+        "ec2-subnet-dns64",
         "ec2-vpc",
         "ecs-bluegreen",
         "ecs-fargate",
@@ -2976,6 +2982,7 @@
           "l2"
         ],
         "ec2-instance": [
+          "l1",
           "l2"
         ],
         "ec2-instance-fanout": [
@@ -2983,6 +2990,10 @@
         ],
         "ec2-route-targets": [
           "l1"
+        ],
+        "ec2-subnet-dns64": [
+          "l1",
+          "literal"
         ],
         "ec2-vpc": [
           "l2"
@@ -3457,6 +3468,7 @@
         "ec2-instance",
         "ec2-instance-fanout",
         "ec2-route-targets",
+        "ec2-subnet-dns64",
         "ec2-vpc",
         "ec2-vpc-ipam",
         "ecs-bluegreen",
@@ -3584,6 +3596,9 @@
           "l2"
         ],
         "ec2-route-targets": [
+          "l1"
+        ],
+        "ec2-subnet-dns64": [
           "l1"
         ],
         "ec2-vpc": [
@@ -7980,6 +7995,7 @@
         "rollback-sqs-cooldown",
         "route53",
         "s3-analytics-inventory",
+        "s3-event-notification",
         "s3-lifecycle",
         "scheduler-custom-group",
         "schema-v11-to-v12-migration",
@@ -8195,6 +8211,9 @@
         ],
         "s3-analytics-inventory": [
           "l1"
+        ],
+        "s3-event-notification": [
+          "l2"
         ],
         "s3-lifecycle": [
           "l1"

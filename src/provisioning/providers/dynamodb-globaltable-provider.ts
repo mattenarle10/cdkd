@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import { DescribeKeyCommand, KMSClient } from '@aws-sdk/client-kms';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { isUsableAttemptedName } from '../../state/unsettled-properties.js';
 import {
@@ -600,6 +601,12 @@ export class DynamoDBGlobalTableProvider implements ResourceProvider {
    * chain. Lifetime is the provider instance — one deploy run.
    */
   private regionalClientCache = new Map<string, DynamoDBClient>();
+  /**
+   * go-to-k/cdkd#5790: `KeyManager` per KMS key ARN, for the drift pair hook.
+   * `undefined` = could not be read. One lookup per key per provider instance.
+   */
+  private kmsKeyManagerCache = new Map<string, Promise<string | undefined>>();
+  private kmsClientCache = new Map<string, KMSClient>();
   /**
    * Caches per-region `ApplicationAutoScalingClient` instances for
    * per-replica `ReadCapacityAutoScalingSettings` reverse-mapping in
@@ -10544,7 +10551,53 @@ export class DynamoDBGlobalTableProvider implements ResourceProvider {
       localRegion,
       completed !== baseline
     );
-    return converted === baseline ? { baseline, aws } : { baseline: converted, aws };
+    // go-to-k/cdkd#5789: the read-back puts each replica's class and deletion
+    // protection on its entry (#5397); a baseline that never declared them
+    // (a template bag, when the record has no `observedProperties`) takes
+    // them at their AWS default only.
+    const defaulted = completeReplicaDefaults(converted, aws);
+    // go-to-k/cdkd#5790: a template on the AWS managed key declares no replica
+    // key, but the read-back names the key's ARN on each replica.
+    const keyed = await completeAwsManagedReplicaKeys(defaulted, aws, (arn) =>
+      this.kmsKeyManager(arn)
+    );
+    return keyed === baseline ? { baseline, aws } : { baseline: keyed, aws };
+  }
+
+  /**
+   * `KeyManager` of the KMS key `arn` (`'AWS'` for an AWS managed key), read in
+   * the ARN's own region; `undefined` when it cannot be read, so the caller
+   * completes nothing and the drift stays visible (go-to-k/cdkd#5790).
+   */
+  private kmsClientFor(region: string): KMSClient {
+    let client = this.kmsClientCache.get(region);
+    if (client === undefined) {
+      client = new KMSClient({ ...clientDefaultsFor(this.credentialConfig), region });
+      this.kmsClientCache.set(region, client);
+    }
+    return client;
+  }
+
+  private kmsKeyManager(arn: string): Promise<string | undefined> {
+    const cached = this.kmsKeyManagerCache.get(arn);
+    if (cached !== undefined) return cached;
+    const region = /^arn:aws[a-z-]*:kms:([a-z0-9-]+):/.exec(arn)?.[1];
+    const lookup =
+      region === undefined
+        ? Promise.resolve(undefined)
+        : this.kmsClientFor(region)
+            .send(new DescribeKeyCommand({ KeyId: arn }))
+            .then(
+              (out) => out.KeyMetadata?.KeyManager,
+              (err: unknown) => {
+                this.logger.debug(
+                  `Could not read the KMS key manager for a replica key: ${describeAwsFailure(err).summary}`
+                );
+                return undefined;
+              }
+            );
+    this.kmsKeyManagerCache.set(arn, lookup);
+    return lookup;
   }
 
   /**
@@ -11397,6 +11450,138 @@ function readReplicaDisassociationProtection(
   replica: Record<string, unknown> | undefined
 ): boolean | undefined {
   return coerceCfnBoolean(replica?.[DISASSOCIATION_PROTECTION_KEY]);
+}
+
+/**
+ * The `Replicas[]` members `readCurrentState` writes on every entry, and the
+ * exact value each reads as when the replica was left at AWS's default
+ * (go-to-k/cdkd#5789). Any other value -- a key, an enabled flag, a tag -- is
+ * not a default and is never completed.
+ */
+const REPLICA_DRIFT_DEFAULTS: ReadonlyArray<readonly [string, (value: unknown) => boolean]> = [
+  ['TableClass', (v) => v === 'STANDARD'],
+  ['DeletionProtectionEnabled', (v) => v === false],
+  ['ContributorInsightsSpecification', (v) => isExactly(v, { Enabled: false })],
+  ['PointInTimeRecoverySpecification', (v) => isExactly(v, { PointInTimeRecoveryEnabled: false })],
+  ['Tags', (v) => Array.isArray(v) && v.length === 0],
+];
+
+/** A plain object holding exactly `expected`'s keys and values. */
+function isExactly(value: unknown, expected: Record<string, unknown>): boolean {
+  const record = asRecord(value);
+  if (record === undefined) return false;
+  const keys = Object.keys(record).filter((k) => record[k] !== undefined);
+  return (
+    keys.length === Object.keys(expected).length &&
+    Object.entries(expected).every(([k, v]) => record[k] === v)
+  );
+}
+
+/**
+ * go-to-k/cdkd#5789: `readCurrentState` writes every `REPLICA_DRIFT_DEFAULTS`
+ * member into EVERY `Replicas[]` entry (`TableClass` and the protection flag
+ * on each entry since #5397), and arrays compare whole. A baseline entry that
+ * omits one -- a template bag the comparison falls back to when the record has
+ * no `observedProperties` (a rollback's reverse-replacement re-create, a
+ * pre-v3 record) -- takes the AWS side's value ONLY when that value is the
+ * member's AWS default, matched by `Region`. A non-default live value still
+ * differs, and `drift --revert` sends nothing the live table lacks. Identity
+ * when nothing is completed.
+ */
+function completeReplicaDefaults(
+  baseline: Record<string, unknown>,
+  aws: Record<string, unknown>
+): Record<string, unknown> {
+  const key = 'Replicas';
+  const baselineReplicas = baseline[key];
+  const awsReplicas = aws[key];
+  if (!Array.isArray(baselineReplicas) || !Array.isArray(awsReplicas)) return baseline;
+  let changed = false;
+  const next = baselineReplicas.map((entry) => {
+    const record = asRecord(entry);
+    const region = record?.['Region'];
+    if (record === undefined || typeof region !== 'string') return entry;
+    const live = awsReplicas.map(asRecord).find((r) => r?.['Region'] === region);
+    if (live === undefined) return entry;
+    let out: Record<string, unknown> | undefined;
+    for (const [member, isDefault] of REPLICA_DRIFT_DEFAULTS) {
+      if (record[member] !== undefined || !isDefault(live[member])) continue;
+      out = { ...(out ?? record), [member]: structuredClone(live[member]) };
+    }
+    if (out === undefined) return entry;
+    changed = true;
+    return out;
+  });
+  return changed ? { ...baseline, [key]: next } : baseline;
+}
+
+/**
+ * go-to-k/cdkd#5790: a baseline on the AWS managed key -- top-level
+ * `SSESpecification` `SSEEnabled: true`, `SSEType: 'KMS'`, no key, which is
+ * what CDK renders for `TableEncryptionV2.awsManagedKey()` -- declares no
+ * per-replica key, while the read-back writes each replica's
+ * `SSESpecification: { KMSMasterKeyId: <arn> }`. A baseline replica entry
+ * with no `SSESpecification` takes the live one ONLY when KMS reports EVERY
+ * live replica's key AWS managed (`SSEType` may be omitted: KMS is its one
+ * value); a customer managed key, an unreadable key, or a baseline
+ * naming any key completes nothing. Identity when nothing is completed.
+ */
+async function completeAwsManagedReplicaKeys(
+  baseline: Record<string, unknown>,
+  aws: Record<string, unknown>,
+  keyManager: (arn: string) => Promise<string | undefined>
+): Promise<Record<string, unknown>> {
+  const sse = asRecord(baseline['SSESpecification']);
+  if (
+    sse === undefined ||
+    sse['SSEEnabled'] !== true ||
+    (sse['SSEType'] !== undefined && sse['SSEType'] !== 'KMS') ||
+    sse['KMSMasterKeyId'] !== undefined
+  ) {
+    return baseline;
+  }
+  const baselineReplicas = baseline['Replicas'];
+  const awsReplicas = aws['Replicas'];
+  if (!Array.isArray(baselineReplicas) || !Array.isArray(awsReplicas)) return baseline;
+  // Every live replica must be on an AWS managed key: a mixed table (one
+  // replica moved to a customer managed key) completes nothing, so drift
+  // shows it and `drift --revert`'s desired bag still names no local key,
+  // which `update()` answers by re-sending the AWS managed key to every
+  // replica (security review of #5790).
+  const wantsKey = baselineReplicas.some((entry) => {
+    const record = asRecord(entry);
+    return record !== undefined && record['SSESpecification'] === undefined;
+  });
+  if (!wantsKey) return baseline;
+  const liveKeys = new Map<string, string>();
+  for (const live of awsReplicas.map(asRecord)) {
+    const region = live?.['Region'];
+    const liveSse = asRecord(live?.['SSESpecification']);
+    const arn = liveSse?.['KMSMasterKeyId'];
+    if (
+      typeof region !== 'string' ||
+      liveSse === undefined ||
+      typeof arn !== 'string' ||
+      Object.keys(liveSse).length !== 1
+    ) {
+      return baseline;
+    }
+    liveKeys.set(region, arn);
+  }
+  const managers = await Promise.all([...liveKeys.values()].map((arn) => keyManager(arn)));
+  if (managers.some((m) => m !== 'AWS')) return baseline;
+  let changed = false;
+  const next = baselineReplicas.map((entry) => {
+    const record = asRecord(entry);
+    const region = record?.['Region'];
+    if (record === undefined || typeof region !== 'string') return entry;
+    if (record['SSESpecification'] !== undefined) return entry;
+    const arn = liveKeys.get(region);
+    if (arn === undefined) return entry;
+    changed = true;
+    return { ...record, SSESpecification: { KMSMasterKeyId: arn } };
+  });
+  return changed ? { ...baseline, Replicas: next } : baseline;
 }
 
 /**

@@ -902,7 +902,10 @@ export interface UpdateContext extends SecretMaskingContext {
    * metric the response did not list as current, a tag key the record
    * lacked). If the update then fails, the record keeps them as
    * `ResourceState.unsettledItems`, and the next convergence may remove an
-   * item it names that neither the record nor the template declares.
+   * item it names that neither the record nor the template declares. A
+   * provider whose own `readUnsettled` reads the names as "touched by cdkd"
+   * may also name the items it REMOVED (`AssociatedRoles`,
+   * `db-associated-roles.ts`).
    */
   markAttempted?: ((path: string, items: readonly string[]) => void) | undefined;
 
@@ -1747,8 +1750,11 @@ export interface ResourceProvider {
    * docs/provider-rules.md).
    *
    * MUST be NON-MUTATING, and return BOTH inputs by identity when nothing
-   * applies. Async only so a provider can resolve the same client region its
-   * own `readCurrentState` used; it must issue no AWS call.
+   * applies. Async so a provider can resolve the same client region its own
+   * `readCurrentState` used. It issues no AWS call, except a READ-ONLY lookup
+   * that decides what an AWS value means and whose failure completes
+   * NOTHING, leaving the difference visible: the GlobalTable provider's KMS
+   * `DescribeKey` for a replica key on the AWS managed key (issue #5790).
    *
    * @param resourceType e.g. `AWS::DynamoDB::GlobalTable`
    * @param baseline the drift baseline (`observedProperties`, else `properties`)

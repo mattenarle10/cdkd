@@ -1544,9 +1544,13 @@ Checklist when writing or reviewing an `update()`:
   `false` on both types. Every other measured removal (`DeletionProtection`,
   `EnableIAMDatabaseAuthentication`, `MonitoringInterval`, `EngineVersion`,
   `MonitoringRoleArn`, and more) is KEPT, so `update()` forwards it only when
-  present. A removed DBCluster `EnableHttpEndpoint: true` is the exception the
-  handler source shows: CloudFormation turns the Data API off
-  (`DisableHttpEndpoint`), and so does cdkd.
+  present. A removed DBCluster `EnableHttpEndpoint: true` and
+  `EnableLocalWriteForwarding: true` are the exceptions the handler source
+  shows: CloudFormation turns the Data API off (`DisableHttpEndpoint`) and
+  sends `EnableLocalWriteForwarding: false`, and so does cdkd. A removed
+  `AssociatedRoles` on either type detaches every recorded role, as the
+  handlers' `updateAssociatedRoles` removes the previous roles the desired
+  list lacks.
 - A real CloudFormation A/B can show it KEEPS the live value: for
   `AWS::DLM::LifecyclePolicy`, `CreateInterval`, `RetainInterval`, `CopyTags`,
   `ExtendDeletion`, `CrossRegionCopyTargets` and `Exclusions` get no reset
@@ -1679,7 +1683,11 @@ Checklist when writing or reviewing an `update()`:
   `PubliclyAccessible: true` that then failed and rolled back left it true too
   (read after UPDATE_ROLLBACK_COMPLETE and about four minutes later), so a
   rollback sends no reset either. Not measured:
-  `ServerlessScalingConfiguration` and `NetworkType`.
+  `ServerlessScalingConfiguration` and `NetworkType`. An update attaches only
+  the roles the template added, so a declared role detached outside cdkd is
+  not attached again; that follows the RDS handlers' `updateAssociatedRoles`,
+  which the Neptune DBCluster shares through cdkd's role plan, and is not
+  measured on Neptune.
   Real CloudFormation measurement, go-to-k/cdkd#5638 (us-east-1, CloudTrail's
   request parameters of each handler call): a Neptune DBCluster with
   `SourceDBClusterIdentifier` calls `RestoreDBClusterToPointInTime`, winning

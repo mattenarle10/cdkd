@@ -56,6 +56,11 @@
 # upgraded version live. A cdkd re-sending the unchanged EngineVersion fails
 # that deploy: RDS refuses it as a downgrade.
 #
+# go-to-k/cdkd#5640 (EngineLifecycleSupport / MasterUserAuthenticationType):
+# declared in every phase; before #5640 either one routed the instance to Cloud
+# Control (the provisionedBy=sdk guard catches it). EngineLifecycleSupport is
+# asserted live.
+#
 # go-to-k/cdkd#2762 (DBInstance DBParameterGroupName): the instance declares a
 # custom parameter group (A); the provisionedBy=sdk guard is what a pre-fix cdkd
 # fails, and phase 1 asserts A is live and in-sync. Phase 2b changes ONLY the
@@ -70,6 +75,12 @@
 # property, which disables both, as CloudFormation's handler does (it disables
 # what the previous template declared), with parameter group B kept beside it.
 # Cleanup deletes the CloudWatch log groups RDS created for the exports.
+#
+# go-to-k/cdkd#5640 (DBInstance AssociatedRoles): phase 1 attaches an import
+# role for `s3Import` (asserted live; before #5640 the provisionedBy=sdk guard
+# fails), phase 2 swaps it for an export role for `s3Export`, and phase 2c
+# drops the property, which detaches it (each asserted live). Both roles are
+# stack resources in every phase.
 #
 # go-to-k/cdkd#5640 (DBInstance DBName / AvailabilityZone): declared unchanged
 # in every phase; the provisionedBy=sdk guard is what a pre-fix cdkd fails, and
@@ -493,6 +504,23 @@ assert_instance_field() {
   echo "    OK: ${4}: ${1} == ${2} on AWS (${3}, go-to-k/cdkd#2762)"
 }
 assert_instance_field '.StorageType' 'gp3' 'StorageType' 'phase 1'
+
+# go-to-k/cdkd#5640: the associations, as `<role name>:<feature>` sorted (RDS
+# answers in its own order); cdkd returns once each change reads back. An
+# unread instance or a missing list prints a marker, never the empty string a
+# detached list prints.
+ROLES_JQ='if type != "object" then "<no instance read>" elif .AssociatedRoles == null then "<no AssociatedRoles field>" else ([.AssociatedRoles[] | ((.RoleArn | split("/") | last) + ":" + (.FeatureName // ""))] | sort | join(" ")) end'
+# usage: state_role_name <logical id prefix> -> the IAM role's name from state
+state_role_name() {
+  echo "${STATE}" | jq -r --arg re "^$1" '[.resources | to_entries[] | select(.value.resourceType == "AWS::IAM::Role" and (.key | test($re))) | .value.physicalId] | first // ""'
+}
+IMPORT_ROLE_NAME=$(state_role_name "S3ImportRole")
+EXPORT_ROLE_NAME=$(state_role_name "S3ExportRole")
+if [ -z "${IMPORT_ROLE_NAME}" ] || [ -z "${EXPORT_ROLE_NAME}" ]; then
+  echo "FAIL: #5640: could not resolve the import / export role names from state (got '${IMPORT_ROLE_NAME}' / '${EXPORT_ROLE_NAME}')" >&2
+  exit 1
+fi
+assert_instance_field "${ROLES_JQ}" "${IMPORT_ROLE_NAME}:s3Import" 'AssociatedRoles (the create attaches the declared role)' 'phase 1'
 assert_instance_field '.AllocatedStorage' '400' 'AllocatedStorage' 'phase 1'
 assert_instance_field '.Iops' '13000' 'Iops' 'phase 1'
 assert_instance_field '.StorageThroughput' '600' 'StorageThroughput' 'phase 1'
@@ -514,6 +542,12 @@ assert_instance_field '.PerformanceInsightsRetentionPeriod' '31' 'PerformanceIns
 assert_instance_field '.NetworkType' 'IPV4' 'NetworkType' 'phase 1'
 assert_instance_field '.LicenseModel' 'postgresql-license' 'LicenseModel' 'phase 1'
 assert_instance_field '.DatabaseInsightsMode' 'standard' 'DatabaseInsightsMode' 'phase 1'
+# go-to-k/cdkd#5640: EngineLifecycleSupport rode CreateDBInstance (AWS's
+# default is open-source-rds-extended-support, so a dropped value reads back
+# differently). MasterUserAuthenticationType `password` is write-only (no
+# Describe field): only the provisionedBy=sdk guard above sees it. Both are
+# unchanged in every phase.
+assert_instance_field '.EngineLifecycleSupport' 'open-source-rds-extended-support-disabled' 'EngineLifecycleSupport' 'phase 1'
 # go-to-k/cdkd#2762: DBParameterGroupName rode CreateDBInstance. RDS stores the
 # name lower-cased, so both sides are compared lower-cased.
 PG_A_LOWER=$(printf '%s' "${PG_A_ID}" | tr '[:upper:]' '[:lower:]')
@@ -710,6 +744,7 @@ echo "    OK: after removal, AWS kept DeletionProtection=true + IAMDatabaseAuthe
 # asserted the non-default false), and the storage was left alone.
 INSTANCE="${AFTER}"
 assert_instance_field '.BackupRetentionPeriod' '5' 'BackupRetentionPeriod change' 'phase 2'
+assert_instance_field "${ROLES_JQ}" "${EXPORT_ROLE_NAME}:s3Export" 'AssociatedRoles swap (detach the import role, attach the export role; go-to-k/cdkd#5640)' 'phase 2'
 assert_instance_field '.PreferredMaintenanceWindow' 'mon:05:00-mon:05:30' 'PreferredMaintenanceWindow change' 'phase 2'
 assert_instance_field '.PerformanceInsightsRetentionPeriod' '7' 'PerformanceInsightsRetentionPeriod change' 'phase 2'
 assert_instance_field '.PerformanceInsightsEnabled' 'true' 'EnablePerformanceInsights beside the retention change' 'phase 2'
@@ -790,6 +825,8 @@ INSTANCE=$(aws rds describe-db-instances \
   --region "${REGION}" \
   --query 'DBInstances[0]' --output json)
 assert_log_exports '' 'a removed EnableCloudwatchLogsExports disables what the previous template declared' 'phase 2c'
+# go-to-k/cdkd#5640: phase 2 asserted the export role live; the removal detaches it.
+assert_instance_field "${ROLES_JQ}" '' 'a removed AssociatedRoles detaches the recorded role (go-to-k/cdkd#5640)' 'phase 2c'
 assert_instance_field '(.DBParameterGroups[0].DBParameterGroupName // "null") | ascii_downcase' "${PG_B_LOWER}" 'the retained parameter group' 'phase 2c'
 
 # --- Phase 3: destroy -------------------------------------------------

@@ -80,12 +80,20 @@ Docker is required. The first run also pulls the ECS metadata sidecar image,
 | `--platform <platform>` | from `RuntimePlatform.CpuArchitecture` | Force `linux/amd64` or `linux/arm64`. |
 | `--no-pull` | off | Skip `docker pull` for every container image and the sidecar. |
 | `--ecr-role-arn <arn>` | — | Role to assume before authenticating to ECR, for another account's registry. No effect with `--no-pull`. |
+| `--image-override <task=dockerfile or dockerfile...>` | — | Build the task's image from a local Dockerfile instead. |
+| `--image-build-arg <KEY=VAL...>` | — | `docker build --build-arg` for the override build. |
+| `--image-build-secret <id=src...>` | — | `docker build --secret` for the override build. |
+| `--image-target <stage or task=stage...>` | — | `docker build --target` for the override build. |
+| `--image-context <dir or task=dir...>` | the Dockerfile's directory | `docker build` context for the override build. |
+| `--no-interactive-overrides` | off | Do not prompt for a Dockerfile at startup. |
+| `--strict-overrides` | off | Refuse to start while the task still runs a registry image. |
 
 The command also accepts every
 [common flag](local-emulation.md#common-flags). Three of them behave in a
 way specific to this command:
 
-- `--env-vars` is keyed by container name.
+- `--env-vars` is keyed by container name. A `Secrets` entry whose key the
+  file gives is not fetched from AWS.
 - `--container-host` is the IP that published ports bind to.
 - `--profile` credentials are passed to the containers.
 
@@ -142,14 +150,20 @@ Inside the network:
   `ECS_CONTAINER_METADATA_URI_V4=http://169.254.170.2/v4/<container-name>`
   set, as on ECS.
 - **Credentials.** With `--assume-task-role`, every container also has
-  `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/role/<task-role-arn>` set.
+  `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI=/creds` set. The sidecar holds the
+  assumed role's credentials and serves them there, so an AWS SDK in the
+  container runs as the task role.
 - **Your machine.** A container reaches it as
   [`host.docker.internal`](local-emulation.md#reaching-a-server-on-the-host),
   where the Docker daemon supports that name.
 
 The network is named `cdkd-local-task-<random>`, or
 `<cluster>-task-<random>` when you pass `--cluster`. Its subnet is always
-`169.254.170.0/24`.
+`169.254.170.0/24`: AWS SDKs read task-role credentials only from
+`169.254.170.2`. So only one `run-task` can be active at a time, and a
+`run-task` cannot run beside a `start-service` or `start-alb` started with
+`--assume-role`, which takes the same subnet. The second run fails to create
+its network.
 
 ### Reaching a container from the host
 
@@ -234,9 +248,37 @@ assume a role in the target account.
 
 An image from `ContainerImage.fromEcrRepository(repo)`, where `repo` is in
 the same stack, needs `--from-state` or `--from-cfn-stack` so that cdkd can
-find the deployed repository's name.
+find the deployed repository's name, or `--image-override` to build it
+locally instead.
 [Images in cdkd local run-task](local-run-task-images.md) covers that case,
 which registry hosts count as ECR, and how an asset image is recognized.
+
+### Building the image from a local Dockerfile
+
+A registry image (ECR or public) runs the bytes that were pushed, so local
+source edits never reach the container. `--image-override` builds the task's
+image from a Dockerfile in your working copy instead, and runs that:
+
+```bash
+# the task's essential container, from a local Dockerfile
+cdkd local run-task MyStack/TaskDef --from-state \
+  --image-override MyStack/TaskDef=./web/Dockerfile
+
+# a monorepo: the Dockerfile sits below the build context it needs
+cdkd local run-task MyStack/TaskDef \
+  --image-override TaskDef=apps/web/Dockerfile --image-context TaskDef=.
+```
+
+The override replaces the image of the task's essential container (the first
+one, when none is marked essential). The key before `=` is the target you
+passed, the task definition's logical id, `Stack:LogicalId`, or its construct
+id. In a terminal, cdkd asks for a Dockerfile at startup whenever the task's
+image is a registry image, and a bare `--image-override <dockerfile>` asks
+which task it is for; `--no-interactive-overrides` turns both questions off. The other flags work as in
+[Image overrides for local ECS services](local-start-service-image-overrides.md).
+
+When the image stays a registry image, cdkd warns that local edits will not
+take effect; `--strict-overrides` makes that an error.
 
 ## Environment variables and secrets
 

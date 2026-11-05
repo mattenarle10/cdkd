@@ -267,15 +267,24 @@ export const MEMBER_RENAMES: Record<string, TypeRenames> = {
     members: {
       IamInstanceProfile: ['Name'],
       'NetworkInterfaces.GroupSet': ['Groups'],
+      // go-to-k/cdkd#5630: RunInstances' `Placement.GroupName`.
+      PlacementGroupName: ['GroupName'],
+      // go-to-k/cdkd#5630: ModifyPrivateDnsNameOptions' spelling.
+      'PrivateDnsNameOptions.HostnameType': ['PrivateDnsHostnameType'],
       SecurityGroupIds: ['Groups'],
     },
     containers: {
       CreditSpecification: ['InstanceCreditSpecifications'],
       MetadataOptions: ['ModifyInstanceMetadataOptionsCommand'],
+      // go-to-k/cdkd#5630: the update's members sit at the command's top level.
+      PrivateDnsNameOptions: ['ModifyPrivateDnsNameOptionsCommand'],
     },
     transformed: {
       Monitoring:
         'MonitorInstances versus UnmonitorInstances: the value picks the command, which carries only `InstanceIds`',
+      // go-to-k/cdkd#5630.
+      PropagateTagsToVolumeOnCreation:
+        'the flag adds a `volume` copy of the instance TagSpecification to RunInstances; it carries the tags, not the value',
     },
   },
   'AWS::EC2::NatGateway': {
@@ -620,6 +629,8 @@ export const MEMBER_RENAMES: Record<string, TypeRenames> = {
       PerformanceInsightsEnabled: ['EnablePerformanceInsights'],
     },
     containers: {
+      // go-to-k/cdkd#5639: one AddRoleToDBCluster call per entry.
+      AssociatedRoles: ['AddRoleToDBClusterCommand'],
       MasterUserSecret: ['CreateDBClusterCommand', 'ModifyDBClusterCommand'],
     },
     transformed: {
@@ -638,6 +649,8 @@ export const MEMBER_RENAMES: Record<string, TypeRenames> = {
       VPCSecurityGroups: ['VpcSecurityGroupIds'],
     },
     containers: {
+      // go-to-k/cdkd#5640: one AddRoleToDBInstance call per entry.
+      AssociatedRoles: ['AddRoleToDBInstanceCommand'],
       MasterUserSecret: ['CreateDBInstanceCommand', 'ModifyDBInstanceCommand'],
     },
   },

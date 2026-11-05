@@ -9,11 +9,19 @@ description: "Build an ECS service's image from a local Dockerfile while cdkd lo
 [`cdkd local start-service`](local-start-service.md) and
 [`cdkd local start-alb`](local-start-alb.md). It builds a service's image from
 a local Dockerfile, in place of the image the service names.
+[`cdkd local run-task`](local-run-task.md#building-the-image-from-a-local-dockerfile)
+takes the same flags for a single task.
 
 You need it when the service uses an image that is already in a registry
 (`ContainerImage.fromEcrRepository` or `fromRegistry`). cdkd pulls that image,
 so edits to your working copy would never reach the container, and `--watch`
 has nothing to rebuild for that service.
+
+An image from an ECR repository that the same stack creates
+(`ContainerImage.fromEcrRepository(repo)` on a repository in the app) needs it
+too, unless `--from-state` or `--from-cfn-stack` finds the deployed
+repository: without one, the image has no address to pull from. cdkd refuses
+to start while such an image has no override, before any service starts.
 
 Combine it with `--from-cfn-stack` or `--from-state` to run your working copy
 against the deployed stack's real configuration:
@@ -51,7 +59,7 @@ pick one. Two keys that name the same service are also an error.
 
 ## Build arguments, secrets and stages
 
-Three flags pass options to the override builds. Each takes a value for every
+Four flags pass options to the override builds. Each takes a value for every
 build or a value for one service, and the value for one service wins.
 
 | Flag | For every build | For one service |
@@ -59,6 +67,14 @@ build or a value for one service, and the value for one service wins.
 | `--image-build-arg` | `KEY=VAL` | `<service>:KEY=VAL` |
 | `--image-build-secret` | `id=src` | `<service>:id=src` |
 | `--image-target` | `<stage>` | `<service>=<stage>` |
+| `--image-context` | `<dir>` | `<service>=<dir>` |
+
+`--image-context` sets the `docker build` context, for a Dockerfile that sits
+below the directory it needs, as in a monorepo whose apps share code:
+`--image-override Api=apps/api/Dockerfile --image-context Api=.`. By default
+the context is the Dockerfile's directory. cdkd resolves a relative directory
+against the working directory and expands `~`; one that does not exist stops
+the start.
 
 `--image-build-secret` supplies the file that a Dockerfile line such as
 `RUN --mount=type=secret,id=<id>` reads, which is how a build reaches a

@@ -50,7 +50,11 @@ verify, clean up.
    asset-storage ownership, #4063) gets its OWN region, probed for what that
    header needs absent or present, passed via `AWS_REGION` or the header's
    region variable. A fixture that runs `cdkd gc` runs ALONE, after the set:
-   gc refuses while ANY stack holds a lock, its batch-mates' included. Every
+   gc refuses while ANY stack holds a lock, its batch-mates' included. So does
+   `custom-resource-provider`: its Arm D needs ITS deploy to add the state
+   bucket's lifecycle rule, which any batch-mate invoking a Lambda-backed
+   custom resource (`autoDeleteObjects`, `BucketDeployment`, `AwsCustomResource`
+   included) adds first (go-to-k/cdkd#5752). Every
    resource-scan `--region`, `AWS_REGION` and synth/deploy/destroy `--region`
    in steps 4-7 then uses the fixture's region. Synth first (for the stack name and
    resource types), then scan:
@@ -300,8 +304,8 @@ verify, clean up.
     docker network ls --filter name=cdkd-local-svc- --format '{{.ID}}'
     ```
 
-    Subnet-overlap gotcha: `cdkd local start-service` uses the FIXED subnet
-    `169.254.171.0/24`, so a `local-start-*` test can fail with `Pool overlaps`
+    Subnet-overlap gotcha: `run-task` and `--assume-role` runs PIN
+    `169.254.170.0/24`, so a `local-*` test can fail with `Pool overlaps`
     even when all three are empty — a foreign leftover network (e.g. cdk-local's
     `cdkl-svc-*`) may own the subnet. Diagnose with
     `docker network inspect $(docker network ls -q) --format '{{.Name}} {{range .IPAM.Config}}{{.Subnet}}{{end}} {{len .Containers}}'`
@@ -315,7 +319,8 @@ verify, clean up.
 11. **Record the run in the integ ledger (MANDATORY — every run, pass OR fail)**:
     `docs/_generated/integ-last-run.tsv` is a COMMITTED update-type ledger (one
     row per test) feeding `/pick-integ`. Write it on EVERY invocation, right
-    after step 9 (or right after a failure).
+    after step 9 (or right after a failure) — except a `/work-issues` EARLY run
+    or §8-d probe, which commits none: the final run's row replaces it (#5795).
 
     Columns (TAB): `test  last_run_iso  result  duration_s  flow  note`. `result`
     is `PASS` only at the same bar as step 9's marker (destroy 0 errors / 0

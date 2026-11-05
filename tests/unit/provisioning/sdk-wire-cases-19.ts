@@ -50,6 +50,68 @@ const INSTANCE_ID = 'instance-1';
 const INSTANCE_ARN = `arn:aws:rds:us-east-1:${ACCOUNT}:db:${INSTANCE_ID}`;
 const DEFAULT_SG = 'sg-default';
 
+/** Two associations, each its own role for its own feature (go-to-k/cdkd#5639 / #5640). */
+const ROLES = [
+  { RoleArn: `arn:aws:iam::${ACCOUNT}:role/role-a`, FeatureName: 's3Import' },
+  { RoleArn: `arn:aws:iam::${ACCOUNT}:role/role-b`, FeatureName: 's3Export' },
+];
+const ROLE_TARGETS = (command: string) =>
+  [0, 1].map((i) => ({
+    path: ['AssociatedRoles', i],
+    command,
+    names: `role-${'ab'[i]}`,
+    notNames: `role-${'ba'[i]}`,
+  }));
+
+/**
+ * A malformed entry is refused before any call: the gap between the record and
+ * the template is what gets DETACHED, so it never reads as empty. A DB
+ * instance's entry also needs its FeatureName (schema-required, and
+ * AddRoleToDBInstance takes none without it).
+ */
+const ROLES_REFUSED = (members: readonly string[], says: RegExp) =>
+  Object.fromEntries(
+    ALL_DIRECTIONS.flatMap((direction) =>
+      [0, 1].flatMap((i) =>
+        members.map((member) => [
+          `${direction}:AssociatedRoles.${i}.${member}`,
+          {
+            says,
+            why: `a malformed AssociatedRoles never reads as empty, or an update would detach every role (desiredAssociatedRoles in ${SRC})`,
+          },
+        ])
+      )
+    )
+  );
+
+/** The roles a bag declares, as the live cluster or instance starts out holding them. */
+function liveRoles(bag: Bag): Bag[] {
+  const declared = bag['AssociatedRoles'];
+  return Array.isArray(declared)
+    ? (declared as Bag[]).map((role) => ({ ...role, Status: 'ACTIVE' }))
+    : [];
+}
+
+/** The live roles after an Add* / Remove* call, applied at once (the settle wait reads it). */
+function roleCallOverrides(
+  add: string,
+  remove: string,
+  roles: { current: Bag[] }
+): Record<string, (input: Record<string, unknown>) => unknown> {
+  return {
+    [add]: (input) => {
+      roles.current.push({ RoleArn: input['RoleArn'], FeatureName: input['FeatureName'], Status: 'ACTIVE' });
+      return {};
+    },
+    [remove]: (input) => {
+      roles.current = roles.current.filter(
+        (role) => !(role['RoleArn'] === input['RoleArn'] && role['FeatureName'] === input['FeatureName'])
+      );
+      return {};
+    },
+  };
+}
+
 /** A Modify* call that only sends what `next` declares: a removal sends nothing. */
 const KEPT = (key: string, where: string): string =>
   `left in place on removal: Modify* treats an absent member as "no change", and real CloudFormation A/Bs (#5004, #1160) measured a removed ${key} KEPT (${SRC}:${where})`;
@@ -163,7 +225,15 @@ function armCluster(_physicalId: string, bag: Bag): void {
   let port = bag['Port'] as number | undefined;
   let logs = liveLogs(bag);
   let httpEndpoint = bag['EnableHttpEndpoint'] === true;
+  let forwarding = bag['EnableLocalWriteForwarding'] === true;
+  const roles = { current: liveRoles(bag) };
   setOutputOverrides({
+    ...roleCallOverrides('AddRoleToDBClusterCommand', 'RemoveRoleFromDBClusterCommand', roles),
+    // The create wait reads back the write forwarding the create sent.
+    CreateDBClusterCommand: (input) => {
+      forwarding = input['EnableLocalWriteForwarding'] === true;
+      return { DBCluster: { DBClusterIdentifier: CLUSTER_ID } };
+    },
     EnableHttpEndpointCommand: () => {
       httpEndpoint = true;
       return {};
@@ -178,6 +248,8 @@ function armCluster(_physicalId: string, bag: Bag): void {
       const sentPort = input['Port'] as number | undefined;
       if (sentPort !== undefined) port = sentPort;
       logs = applyLogDelta(logs, input);
+      const sentForwarding = input['EnableLocalWriteForwarding'] as boolean | undefined;
+      if (sentForwarding !== undefined) forwarding = sentForwarding;
       return {};
     },
     DescribeDBClustersCommand: () => ({
@@ -192,6 +264,8 @@ function armCluster(_physicalId: string, bag: Bag): void {
           VpcSecurityGroups: groups.map((id) => ({ VpcSecurityGroupId: id, Status: 'active' })),
           EnabledCloudwatchLogsExports: logs,
           HttpEndpointEnabled: httpEndpoint,
+          LocalWriteForwardingStatus: forwarding ? 'enabled' : 'disabled',
+          AssociatedRoles: roles.current,
         },
       ],
     }),
@@ -275,6 +349,7 @@ const CLUSTER_CASE: TypeCase = {
       names: '=sg-2',
       notNames: '=sg-1',
     },
+    ...ROLE_TARGETS('RemoveRoleFromDBClusterCommand'),
   ],
   bags: [
     {
@@ -314,6 +389,7 @@ const CLUSTER_CASE: TypeCase = {
         PerformanceInsightsKmsKeyId: KMS,
         PerformanceInsightsRetentionPeriod: 465,
         EnableHttpEndpoint: true,
+        AssociatedRoles: fresh(ROLES),
         Tags: fresh(TAGS),
       },
       expectedSilent: {
@@ -347,7 +423,10 @@ const CLUSTER_CASE: TypeCase = {
           ])
         ),
       },
-      expectedRemovalThrows: TAG_THROWS(ALL_DIRECTIONS, 2),
+      expectedRemovalThrows: {
+        ...TAG_THROWS(ALL_DIRECTIONS, 2),
+        ...ROLES_REFUSED(['RoleArn'], /AssociatedRoles must be a list of objects with a RoleArn;/),
+      },
     },
     {
       name: 'Aurora MySQL, a managed master password',
@@ -358,6 +437,59 @@ const CLUSTER_CASE: TypeCase = {
         MasterUserSecret: { KmsKeyId: SECRET_KMS },
       },
       expectedSilent: { ...CLUSTER_ENGINE_SILENT, ...CLUSTER_MASTER_USERNAME_SILENT },
+    },
+    {
+      name: 'Database Insights, engine lifecycle and master user authentication (go-to-k/cdkd#5639)',
+      bag: {
+        Engine: 'aurora-postgresql',
+        MasterUsername: 'admin',
+        PerformanceInsightsEnabled: true,
+        PerformanceInsightsRetentionPeriod: 465,
+        DatabaseInsightsMode: 'advanced',
+        EngineLifecycleSupport: 'open-source-rds-extended-support-disabled',
+        MasterUserAuthenticationType: 'iam-db-auth',
+      },
+      expectedRemovalThrows: Object.fromEntries(
+        ['update-add', 'update-remove'].map((d) => [
+          `${d}:EngineLifecycleSupport`,
+          {
+            why: `CloudFormation refuses any change to EngineLifecycleSupport, an addition and a removal included ("EngineLifecycleSupport cannot be modified.", measured go-to-k/cdkd#5639), so update() refuses it before any call unless the live cluster already holds the declared value (engineLifecycleSupportAction in ${SRC})`,
+            says: /EngineLifecycleSupport cannot change on an existing DB cluster/,
+          },
+        ])
+      ),
+      expectedSilent: {
+        ...CLUSTER_ENGINE_SILENT,
+        ...CLUSTER_MASTER_USERNAME_SILENT,
+        'update-vary:EngineLifecycleSupport': `refused like its add and removal: any changed value throws before a call (engineLifecycleSupportAction in ${SRC}, go-to-k/cdkd#5639)`,
+        ...Object.fromEntries(
+          ['PerformanceInsightsEnabled', 'PerformanceInsightsRetentionPeriod'].map((key) => [
+            `update-remove:${key}`,
+            CLUSTER_SCALARS_KEPT[`update-remove:${key}`]!,
+          ])
+        ),
+        ...Object.fromEntries(
+          ['DatabaseInsightsMode', 'MasterUserAuthenticationType'].map((key) => [
+            `update-remove:${key}`,
+            `left in place on removal: update() sends ${key} only when the template changed it, and CloudFormation sends none for a removed one (measured with CloudTrail, go-to-k/cdkd#5639; ${SRC})`,
+          ])
+        ),
+      },
+    },
+    {
+      name: 'Aurora MySQL backtracking, local write forwarding and scalability type (go-to-k/cdkd#5639)',
+      bag: {
+        Engine: 'aurora-mysql',
+        MasterUsername: 'admin',
+        BacktrackWindow: 3600,
+        EnableLocalWriteForwarding: true,
+        ClusterScalabilityType: 'standard',
+      },
+      expectedSilent: {
+        ...CLUSTER_ENGINE_SILENT,
+        ...CLUSTER_MASTER_USERNAME_SILENT,
+        'update-remove:BacktrackWindow': `left in place on removal: ModifyDBCluster treats an absent member as "no change", and CloudFormation's handler (Translator.modifyDbClusterRequest) sends null for a removed BacktrackWindow, read from the handler source, not measured (${SRC} clusterModifyScalarMembers)`,
+      },
     },
     {
       name: 'Multi-AZ DB cluster (mysql), a declared Port',
@@ -380,7 +512,9 @@ const CLUSTER_CASE: TypeCase = {
  */
 function armInstance(_physicalId?: string, live: Bag = {}): void {
   let logs = liveLogs(live);
+  const roles = { current: liveRoles(live) };
   setOutputOverrides({
+    ...roleCallOverrides('AddRoleToDBInstanceCommand', 'RemoveRoleFromDBInstanceCommand', roles),
     ModifyDBInstanceCommand: (input) => {
       logs = applyLogDelta(logs, input);
       return {};
@@ -396,6 +530,7 @@ function armInstance(_physicalId?: string, live: Bag = {}): void {
             AllocatedStorage: Number(live['AllocatedStorage']),
           }),
           EnabledCloudwatchLogsExports: logs,
+          AssociatedRoles: roles.current,
         },
       ],
     }),
@@ -447,6 +582,7 @@ const INSTANCE_CASE: TypeCase = {
       names: '=sg-2',
       notNames: '=sg-1',
     },
+    ...ROLE_TARGETS('RemoveRoleFromDBInstanceCommand'),
   ],
   bags: [
     {
@@ -469,6 +605,7 @@ const INSTANCE_CASE: TypeCase = {
         MonitoringRoleArn: MONITORING_ROLE,
         MonitoringInterval: 60,
         EnableIAMDatabaseAuthentication: true,
+        AssociatedRoles: fresh(ROLES),
         Tags: fresh(TAGS),
       },
       expectedSilent: {
@@ -493,7 +630,13 @@ const INSTANCE_CASE: TypeCase = {
           ])
         ),
       },
-      expectedRemovalThrows: TAG_THROWS(ALL_DIRECTIONS, 2),
+      expectedRemovalThrows: {
+        ...TAG_THROWS(ALL_DIRECTIONS, 2),
+        ...ROLES_REFUSED(
+          ['RoleArn', 'FeatureName'],
+          /AssociatedRoles must be a list of objects with a RoleArn and a FeatureName;/
+        ),
+      },
     },
     {
       name: 'a managed master password',
@@ -613,6 +756,34 @@ const INSTANCE_CASE: TypeCase = {
             'DBParameterGroupName',
           ].map((key) => [`update-remove:${key}`, CFN_DIFF_KEPT(key)])
         ),
+      },
+    },
+    {
+      name: 'engine lifecycle and master user authentication (go-to-k/cdkd#5640)',
+      bag: {
+        DBInstanceIdentifier: INSTANCE_ID,
+        DBInstanceClass: 'db.t4g.micro',
+        Engine: 'postgres',
+        AllocatedStorage: '20',
+        MasterUsername: 'admin',
+        EngineLifecycleSupport: 'open-source-rds-extended-support-disabled',
+        MasterUserAuthenticationType: 'iam-db-auth',
+      },
+      expectedRemovalThrows: Object.fromEntries(
+        ['update-add', 'update-remove'].map((d) => [
+          `${d}:EngineLifecycleSupport`,
+          {
+            why: `CloudFormation refuses any change to EngineLifecycleSupport, an addition and a removal included ("EngineLifecycleSupport cannot be modified.", measured go-to-k/cdkd#5640), so update() refuses it before any call unless the live instance already holds the declared value (engineLifecycleSupportAction in ${SRC})`,
+            says: /EngineLifecycleSupport cannot change on an existing DB instance/,
+          },
+        ])
+      ),
+      expectedSilent: {
+        ...INSTANCE_ENGINE_SILENT,
+        'update-vary:EngineLifecycleSupport': `refused like its add and removal: any changed value throws before a call (engineLifecycleSupportAction in ${SRC}, go-to-k/cdkd#5640)`,
+        'update-remove:DBInstanceClass': INSTANCE_CLASS_REMOVED,
+        'update-remove:AllocatedStorage': CFN_DIFF_KEPT('AllocatedStorage'),
+        'update-remove:MasterUserAuthenticationType': CFN_DIFF_KEPT('MasterUserAuthenticationType'),
       },
     },
   ],

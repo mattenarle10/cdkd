@@ -84,6 +84,52 @@ export function instanceSecurityGroupIdsChangeReplaces(
 }
 
 /**
+ * Conditional-replacement predicate for `AWS::EC2::Instance.Tenancy` (issue
+ * [#5630](https://github.com/go-to-k/cdkd/issues/5630)). MEASURED against
+ * CloudFormation (us-east-1, 2026-11-04, a t3.nano; change sets say
+ * `Replacement: Conditional`): removing a declared `default` and adding
+ * `default` to an instance without it both create a new instance.
+ *
+ * - A RECORDED value changed to or from `default` (a removal included)
+ *   replaces, as CloudFormation does.
+ * - A change between two non-default values (`dedicated` <-> `host`) is NOT
+ *   measured (it needs a Dedicated Host): CloudFormation may apply it in place
+ *   with ModifyInstancePlacement on a stopped instance. It does not replace
+ *   here, and `EC2Provider` refuses it before any call rather than guess.
+ * - A value the RECORD lacks does not replace: a record written by an earlier
+ *   cdkd under `--prefer-sdk-route` dropped a declared Tenancy (it was
+ *   SDK-unwired), so the template's value may be what AWS already holds.
+ *   `EC2Provider` reads the live tenancy and refuses (`cdkd deploy --replace`
+ *   opts in) only when it differs.
+ */
+export function instanceTenancyChangeReplaces(oldValue: unknown, newValue: unknown): boolean {
+  if (oldValue == null) return false;
+  if (newValue == null) return true;
+  const text = (v: unknown): string => (typeof v === 'string' ? v : JSON.stringify(v));
+  const before = text(oldValue);
+  const after = text(newValue);
+  if (before === after) return false;
+  return before === 'default' || after === 'default';
+}
+
+/**
+ * Conditional-replacement predicate for
+ * `AWS::EC2::Instance.PrivateDnsNameOptions` (issue
+ * [#5630](https://github.com/go-to-k/cdkd/issues/5630)). MEASURED against
+ * CloudFormation (us-east-1, 2026-11-04, a t3.nano): removing the whole block
+ * creates a new instance (the new one takes the subnet's defaults), while
+ * adding it or changing a member keeps the instance (`EC2Provider` applies
+ * those with ModifyPrivateDnsNameOptions, a HostnameType change with a stop and
+ * a start). A block the RECORD lacks is never a removal.
+ */
+export function instancePrivateDnsNameOptionsChangeReplaces(
+  oldValue: unknown,
+  newValue: unknown
+): boolean {
+  return oldValue != null && newValue == null;
+}
+
+/**
  * Conditional-replacement predicate for
  * `AWS::EC2::Instance.BlockDeviceMappings` (issue
  * [#5446](https://github.com/go-to-k/cdkd/issues/5446)). MEASURED against
@@ -1340,19 +1386,25 @@ export class ReplacementRulesRegistry {
     // EC2 Subnet — VpcId / CidrBlock / AvailabilityZone are createOnly per
     // the CFn registry schema (the DescribeType fallback already classifies
     // them); named here so the classification survives a DescribeType
-    // failure. MapPublicIpOnLaunch is mutable in place via
-    // ModifySubnetAttribute and Tags via CreateTags/DeleteTags — both wired
-    // through EC2Provider.updateSubnet (issue #1300); declaring them
+    // failure. MapPublicIpOnLaunch and EnableDns64 use ModifySubnetAttribute;
+    // Ipv6CidrBlock uses disassociate/associate, and Tags use CreateTags/DeleteTags.
+    // These are wired through EC2Provider.updateSubnet; declaring them
     // updateable pins that routing against future createOnly-fallback drift.
     this.rules.set('AWS::EC2::Subnet', {
       replacementProperties: new Set(['VpcId', 'CidrBlock', 'AvailabilityZone']),
-      updateableProperties: new Set(['MapPublicIpOnLaunch', 'Tags']),
+      updateableProperties: new Set([
+        'MapPublicIpOnLaunch',
+        'EnableDns64',
+        'Ipv6CidrBlock',
+        'Tags',
+      ]),
     });
 
     // EC2 Instance — EbsOptimized can only be changed on a STOPPED instance
     // (a running instance returns IncorrectInstanceState). `updateInstance`
     // stops an instance only for an InstanceType / UserData change (issue
-    // #5446, measured), and an EbsOptimized change was not measured against
+    // #5446, measured) or a PrivateDnsNameOptions.HostnameType change
+    // (go-to-k/cdkd#5630, measured), and an EbsOptimized change was not measured against
     // CloudFormation, so it stays routed to replacement
     // (the create path sets it on the new instance). The other four #609
     // security-backfill props (DisableApiTermination / Monitoring /
@@ -1379,6 +1431,14 @@ export class ReplacementRulesRegistry {
         // no ENI-modification path -- an in-place classification would leave
         // state recording the new value while AWS keeps the old one.
         'NetworkInterfaces',
+        // go-to-k/cdkd#5630: createOnly per the CFn schema, listed here too so
+        // a failed DescribeType still classifies them.
+        'CpuOptions',
+        'HibernationOptions',
+        'PlacementGroupName',
+        'PrivateIpAddress',
+        'Ipv6AddressCount',
+        'Ipv6Addresses',
       ]),
       // Issue #5446: InstanceType / UserData (a stop-modify-start),
       // IamInstanceProfile and, with a SubnetId, SecurityGroupIds update in
@@ -1386,6 +1446,11 @@ export class ReplacementRulesRegistry {
       conditionalReplacements: new Map<string, ConditionalReplacement>([
         ['SecurityGroupIds', instanceSecurityGroupIdsChangeReplaces],
         ['BlockDeviceMappings', instanceBlockDeviceMappingsChangeReplaces],
+        // go-to-k/cdkd#5630: the schema leaves Tenancy mutable; see the
+        // predicate for which changes replace.
+        ['Tenancy', instanceTenancyChangeReplaces],
+        // go-to-k/cdkd#5630: only a removal of the whole block replaces.
+        ['PrivateDnsNameOptions', instancePrivateDnsNameOptionsChangeReplaces],
       ]),
     });
 

@@ -89,9 +89,25 @@ export const CALL_ROOTS: Record<string, CallRoots> = {
         'a restore sends CloudFormation\'s own follow-up and the declared values it drops in separate calls, so a refusal of the second only warns',
     },
   },
+  'AWS::RDS::DBCluster': {
+    repeated: {
+      AddRoleToDBClusterCommand: PER_ITEM('AssociatedRoles', 'RoleArn'),
+    },
+  },
+  'AWS::RDS::DBInstance': {
+    repeated: {
+      AddRoleToDBInstanceCommand: PER_ITEM('AssociatedRoles', 'RoleArn'),
+    },
+  },
   'AWS::EC2::NatGateway': {
     repeated: {
       AssociateNatGatewayAddressCommand: PER_ITEM('AvailabilityZoneAddresses', 'address'),
+    },
+  },
+  'AWS::EC2::Subnet': {
+    repeated: {
+      ModifySubnetAttributeCommand:
+        'one call per attribute (MapPublicIpOnLaunch, EnableDns64), each sending only its own member, which the chain names',
     },
   },
   'AWS::EC2::VPC': {

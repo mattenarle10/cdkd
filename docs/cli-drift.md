@@ -81,6 +81,28 @@ cdkd state refresh-observed MyStack
 Drift compares only the properties that state records. Fields AWS manages and
 cdkd never stored, such as timestamps and generated identifiers, are ignored.
 
+Drift never compares a bucket's `NotificationConfiguration` unless your
+template sets it on the bucket itself. CDK's `bucket.addEventNotification(...)`
+does not set it. A `Custom::S3BucketNotifications` resource writes it after the
+bucket is created, and that custom resource can be in another stack (for
+example `s3.Bucket.fromBucketName(...).addEventNotification(...)`), or another
+tool can write it. So drift does not report those notifications, and `--revert`
+and `--accept` leave the live notifications alone. CloudFormation's drift
+detection does not compare that property either, because the template does not
+set it on the bucket. As in CloudFormation, a console edit to those
+notifications is not reported.
+
+An `AWS::Lambda::EventSourceMapping` deployed by an older cdkd can hold
+`Enabled: false` in its recorded snapshot even though the mapping is enabled.
+Drift does not report that difference while your template leaves `Enabled`
+unset (or sets it to `true`) and the live mapping is enabled, so `--revert`
+never disables the mapping because of it, and you do not need to run `--accept`
+first. A template that sets `Enabled: false` is compared as usual. The old
+snapshot stays in state until the next deploy that updates the mapping, or
+until `cdkd state refresh-observed`. Until then, disabling such a mapping
+outside cdkd is not reported either, because the snapshot already says
+`false`.
+
 ## Reading the report
 
 A stack with no drift prints one line:

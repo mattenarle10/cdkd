@@ -28,7 +28,7 @@ exercises. A turn blocked on a fixture fix never blocks the other lanes.
 step 4**, whichever lane owns it — its isolation rules are not per-lane:
 - a `SAFETY NOTE` fixture gets its OWN region;
 - a `cdkd gc` fixture waits until no other lane's integ is running, and none
-  starts during it;
+  starts during it, and so does `custom-resource-provider` (`/run-integ` step 4);
 - a rollback-journal reader or `cdkd rollback` caller gets its own state
   bucket (#5104);
 - cap fixtures in flight per region at what the account's VPC / EIP / NAT
@@ -48,10 +48,13 @@ Monitor: each line re-ends it, #5413), bans attribution
 lines in the ledger commit (#5104), relaunches only after `pgrep -f verify.sh`
 plus each PID's cwd (`lsof -a -p <pid> -d cwd`) shows no `tests/integration/<fixture>` (a duplicate set FAILed,
 #5695), and STOPs on an unreadable state record, never purging (`/run-integ` step 7). A FAIL names the file EMITTING its message (`grep -rlF` a `${}`-free fragment over `src/`
-and the fixture): the PR is blamed when that file is in its diff, cleared when
-the grep hits only outside it, else UNATTRIBUTED (#4981). Size it for ONE
-context (§8-d probe alone, then fixture batches), each run's fixture,
-`pid=<N>` (bare digits, #5248), log, state
+and the fixture): the PR is blamed when that file is in its diff — unless that file
+only WRAPS an AWS error code, which names the call, not the cause: CloudTrail's
+create/delete sequence for that resource decides blamed vs cleared (a race
+already on `main`, #5744) — cleared when the grep hits only outside the diff,
+else UNATTRIBUTED (#4981). Size it for ONE context (§8-d probe alone, then
+fixture batches), each run's fixture,
+`pid=<N>` (bare digits), log, state
 prefix appended as a line to `<scratch>/integ-<PR>.live` at launch. BEFORE
 dispatching, the PARENT runs `/run-integ` step 4's live-lock check and lists
 open PRs touching each fixture: a held one gets a lock watcher, not a runner
@@ -60,7 +63,7 @@ re-armed on expiry; in `bash -c`: zsh won't split `$pids`),
 read only from each line's `pid=` field (`grep -oE 'pid=[0-9]+'`: a bare-digit
 grep matches a `mktemp` path's zeroes),
 `SendMessage`s the runner as each exits, and alarms when no PID has run for 15
-min unreported (#5135).
+min unreported.
 A stand-down lands on the NEXT tool round: `TaskStop` it once its PIDs exit.
 
 - The `integ-destroy` marker is read from the tree the command runs in, so a
@@ -122,9 +125,11 @@ git rebase origin/main   # its OWN call, then `git status`: at most one conflict
   Once every other pre-merge step (Merge's up-to-date suite too) is done
   and the post-rebase push leaves `git status --porcelain` empty, arm
   `gh pr merge <n> --squash --delete-branch --auto` to land before the next peer
-  merge (#4966). It merges whatever head goes green, so `--disable-auto` before
-  any push or body edit, and re-run that suite before re-arming; the turn holds
-  to `MERGED`.
+  merge (#4966). It merges whatever head goes green, so before any push or body
+  edit run `--disable-auto` in its OWN call, only when `gh pr view <n> --json
+  autoMergeRequest` is non-null: `integ-destroy-gate` refuses it on a
+  deletion-touching PR's stale marker, sinking a chained push (#5744). Re-run that suite before re-arming;
+  the turn holds to `MERGED`.
 
 ### Merge
 
@@ -154,8 +159,8 @@ gh pr merge <n> -R <owner>/<repo> --squash --delete-branch
   ```
 
   **PUSH FIRST, then run the post-rebase suite while CI drains** — so its ledger
-  test runs only after the push: re-run `vp install --frozen-lockfile` (on a
-  stale install gen exits 1), then `vp run gen:all-matrices && vp run format`
+  test runs only after the push: re-run `vp install --frozen-lockfile &&
+  vp run build` (left stale, gen exits 1 and `version.test.ts` fails), then `vp run gen:all-matrices && vp run format`
   (it ends in the ledger normalize) after EVERY rebase; push once
   `git status --porcelain` is empty (`docs/cli-flag-coverage.md` is outside `_generated/`).
 - **A bot can push onto the PR's own branch mid-merge** (#5123): merge with
@@ -274,4 +279,6 @@ done
 Every `OPEN` needs a comment saying the issue is now UNCLAIMED, what the merged
 PR closed, and what remains and why, carrying forward anything expensive the
 lane measured. **Write it AFTER the merge, or state the PR's ACTUAL state.**
-Then go on to §10.
+A `backfill-type` body is rewritten by the coverage sync when the merged PR
+moves the coverage map, so its
+classification lines need no hand restore (#5795). Then go on to §10.

@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from 'node:util';
+import type { Subnet } from '@aws-sdk/client-ec2';
 import {
   EC2Client,
   CreateVpcCommand,
@@ -11,6 +12,8 @@ import {
   DescribeInternetGatewaysCommand,
   DescribeRouteTablesCommand,
   CreateSubnetCommand,
+  AssociateSubnetCidrBlockCommand,
+  DisassociateSubnetCidrBlockCommand,
   DeleteSubnetCommand,
   CreateInternetGatewayCommand,
   DeleteInternetGatewayCommand,
@@ -56,6 +59,7 @@ import {
   AssociateIamInstanceProfileCommand,
   DescribeIamInstanceProfileAssociationsCommand,
   ModifyInstanceAttributeCommand,
+  ModifyPrivateDnsNameOptionsCommand,
   ModifyInstanceMetadataOptionsCommand,
   ModifyInstanceCreditSpecificationCommand,
   DescribeInstanceCreditSpecificationsCommand,
@@ -106,6 +110,8 @@ import {
   type CpuOptionsRequest,
   type HibernationOptionsRequest,
   type ShutdownBehavior,
+  type HostnameType,
+  type PrivateDnsNameOptionsRequest,
   type NatGatewayAddress,
   type NatGateway,
   AssociateNatGatewayAddressCommand,
@@ -124,6 +130,7 @@ import { dynamicReferenceTokens, SECRET_MASK } from '../../deployment/secret-red
 import { getLogger } from '../../utils/logger.js';
 import { canonicalizeRegion } from '../../utils/aws-partition.js';
 import { canonicalizeIpv4Cidr } from '../../utils/ipv4-cidr.js';
+import { canonicalizeIpv6Cidr } from '../../utils/ipv6-cidr.js';
 import { describeAwsFailure, type AwsFailureText } from '../../utils/aws-failure-text.js';
 import { getAwsClients } from '../../utils/aws-clients.js';
 import {
@@ -323,6 +330,39 @@ interface InstanceMemberPlan {
   deleteOnTermination?: Array<{ DeviceName: string; DeleteOnTermination: boolean }>;
   /** go-to-k/cdkd#5630: in place, no stop. */
   shutdownBehavior?: string;
+  /** go-to-k/cdkd#5630: in place, no stop; `true` for a removal. */
+  sourceDestCheck?: boolean;
+  /**
+   * go-to-k/cdkd#5630: a Tenancy the template declares and the record lacks.
+   * `prepareInstanceMemberUpdates` compares it with the live tenancy; nothing
+   * is ever sent for it.
+   */
+  tenancyAddition?: { value: string; replaying: boolean };
+  /**
+   * go-to-k/cdkd#5630: the ModifyPrivateDnsNameOptions members that changed.
+   * A `PrivateDnsHostnameType` needs a stopped instance (CloudFormation stops
+   * and starts it); `prepareInstanceMemberUpdates` drops it when the live
+   * instance already has it.
+   */
+  privateDnsNameOptions?: {
+    PrivateDnsHostnameType?: HostnameType;
+    EnableResourceNameDnsARecord?: boolean;
+    EnableResourceNameDnsAAAARecord?: boolean;
+  };
+}
+
+/**
+ * go-to-k/cdkd#5630: the members of an update that need a stopped instance,
+ * in the order the messages name them.
+ */
+function instanceStopMembers(plan: InstanceMemberPlan): string[] {
+  return [
+    plan.instanceType !== undefined ? 'InstanceType' : '',
+    plan.userData !== undefined ? 'UserData' : '',
+    plan.privateDnsNameOptions?.PrivateDnsHostnameType !== undefined
+      ? 'PrivateDnsNameOptions.HostnameType'
+      : '',
+  ].filter(Boolean);
 }
 
 /**
@@ -990,6 +1030,11 @@ const EIP_ALLOCATION_NOT_FOUND_NAMES: ReadonlySet<string> = new Set([
 
 /** `DescribeInstances`'s answer for an instance id EC2 no longer lists. */
 const INSTANCE_NOT_FOUND_NAMES: ReadonlySet<string> = new Set(['InvalidInstanceID.NotFound']);
+/**
+ * go-to-k/cdkd#5630: attempts `whileLaunchedInstanceNotVisible` gives a call
+ * on a just-launched instance (delays 1, 2, 4, 8, 8, 8, 8 s: ~39s in all).
+ */
+const LAUNCHED_INSTANCE_VISIBILITY_ATTEMPTS = 8;
 /** `DescribeVpcs`'s answer for a VPC id EC2 no longer lists. */
 const VPC_NOT_FOUND_NAMES: ReadonlySet<string> = new Set(['InvalidVpcID.NotFound']);
 const IPAM_POOL_NOT_FOUND_NAMES: ReadonlySet<string> = new Set(['InvalidIpamPoolId.NotFound']);
@@ -1102,7 +1147,88 @@ function replayedRecordNote(context: { replayingState?: boolean } | undefined): 
  * the engine, so only `cdkd drift --revert` brings one to `update()`.
  */
 const VPC_CREATE_ONLY_SENT = ['Ipv4IpamPoolId', 'Ipv4NetmaskLength', 'VpcEncryptionControl'];
-const INSTANCE_CREATE_ONLY_SENT = ['CpuOptions', 'HibernationOptions'];
+// go-to-k/cdkd#5630: `PlacementGroupName` / `PrivateIpAddress` are create-only
+// in the schema too. `Tenancy` replaces only on some changes and is planned on
+// its own (`planInstanceMemberUpdates`).
+const INSTANCE_CREATE_ONLY_SENT = [
+  'CpuOptions',
+  'HibernationOptions',
+  'PlacementGroupName',
+  'PrivateIpAddress',
+  // go-to-k/cdkd#5630: create-only in the schema.
+  'Ipv6AddressCount',
+  'Ipv6Addresses',
+];
+
+/**
+ * go-to-k/cdkd#5630: the refusal for a malformed `AWS::EC2::Instance
+ * Ipv6Addresses` (a list of `{ Ipv6Address }`, the member required by the
+ * schema), so the launch never drops an address the template declared.
+ */
+function instanceIpv6AddressesRefusal(value: unknown, resourceType: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value)) {
+    // The shape only, never the value: a template string may be a resolved secret.
+    const shape = typeof value === 'object' ? 'an object' : `a ${typeof value}`;
+    return `${resourceType}.Ipv6Addresses must be a list of { Ipv6Address } entries (got ${shape})`;
+  }
+  for (const [i, item] of (value as unknown[]).entries()) {
+    const path = `${resourceType}.Ipv6Addresses[${i}]`;
+    const refusal =
+      item === undefined || item === null
+        ? `${path} must be an object (got ${item === null ? 'null' : 'undefined'})`
+        : configStringRefusal(item, 'Ipv6Address', '', path);
+    if (refusal !== undefined) return refusal;
+    const address = (item as Record<string, unknown>)['Ipv6Address'];
+    if (typeof address !== 'string' || address === '') {
+      return `${path}.Ipv6Address is required (the address to assign)`;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * go-to-k/cdkd#5630: the refusal for a malformed `AWS::EC2::Instance
+ * PrivateDnsNameOptions`. Shared by the launch and the update, so neither
+ * drops a member the template declared.
+ */
+function privateDnsNameOptionsRefusal(value: unknown, resourceType: string): string | undefined {
+  const path = `${resourceType}.PrivateDnsNameOptions`;
+  // A blank HostnameType would be dropped from the request and the launch
+  // would take the subnet's default, so it is refused like a malformed one.
+  if (
+    value !== null &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>)['HostnameType'] === ''
+  ) {
+    return `${path}.HostnameType must not be empty`;
+  }
+  return (
+    configStringRefusal(value, 'HostnameType', '', path) ??
+    configBooleanRefusal(value, 'EnableResourceNameDnsARecord', path) ??
+    configBooleanRefusal(value, 'EnableResourceNameDnsAAAARecord', path)
+  );
+}
+
+/**
+ * go-to-k/cdkd#5630: `PrivateDnsNameOptions` as RunInstances takes it (the
+ * member names match), or `undefined` for an absent block. Call it only after
+ * {@link privateDnsNameOptionsRefusal} passed.
+ */
+function privateDnsNameOptionsRequest(value: unknown): PrivateDnsNameOptionsRequest | undefined {
+  if (value === undefined || value === null) return undefined;
+  const block = value as Record<string, unknown>;
+  const hostnameType = block['HostnameType'];
+  const aRecord = coerceCfnBoolean(block['EnableResourceNameDnsARecord']);
+  const aaaaRecord = coerceCfnBoolean(block['EnableResourceNameDnsAAAARecord']);
+  return {
+    ...(typeof hostnameType === 'string' &&
+      hostnameType !== '' && { HostnameType: hostnameType as HostnameType }),
+    ...(aRecord !== undefined && { EnableResourceNameDnsARecord: aRecord }),
+    ...(aaaaRecord !== undefined && { EnableResourceNameDnsAAAARecord: aaaaRecord }),
+  };
+}
 
 /**
  * One of those values with CloudFormation's scalar spellings folded (an
@@ -1271,7 +1397,15 @@ export class EC2Provider implements ResourceProvider {
     ],
     [
       'AWS::EC2::Subnet',
-      new Set(['VpcId', 'CidrBlock', 'AvailabilityZone', 'MapPublicIpOnLaunch', 'Tags']),
+      new Set([
+        'VpcId',
+        'CidrBlock',
+        'AvailabilityZone',
+        'MapPublicIpOnLaunch',
+        'EnableDns64',
+        'Ipv6CidrBlock',
+        'Tags',
+      ]),
     ],
     ['AWS::EC2::InternetGateway', new Set(['Tags'])],
     [
@@ -1386,6 +1520,22 @@ export class EC2Provider implements ResourceProvider {
         'CpuOptions',
         'HibernationOptions',
         'InstanceInitiatedShutdownBehavior',
+        // go-to-k/cdkd#5630: `PrivateIpAddress` and `Placement.Tenancy` /
+        // `.GroupName` ride on RunInstances; `SourceDestCheck` is a
+        // ModifyInstanceAttribute after launch and on update;
+        // `PropagateTagsToVolumeOnCreation` adds a `volume` TagSpecification.
+        'SourceDestCheck',
+        'Tenancy',
+        'PlacementGroupName',
+        'PrivateIpAddress',
+        'PropagateTagsToVolumeOnCreation',
+        // go-to-k/cdkd#5630: RunInstances inputs (buildLaunchOnlyInstanceOptions).
+        // `PrivateDnsNameOptions` also changes in place
+        // (ModifyPrivateDnsNameOptions, planInstanceMemberUpdates).
+        'AdditionalInfo',
+        'Ipv6AddressCount',
+        'Ipv6Addresses',
+        'PrivateDnsNameOptions',
       ]),
     ],
     ['AWS::EC2::NetworkAcl', new Set(['VpcId', 'Tags'])],
@@ -1432,7 +1582,17 @@ export class EC2Provider implements ResourceProvider {
     // SecurityGroupIds is read from `removedProperties` instead, because its
     // CloudFormation reset is a call (clear, disassociate, the VPC's default
     // group), not a value (issue #5446, see planInstanceMemberUpdates).
-    ['AWS::EC2::Instance', new Map<string, unknown>([['Monitoring', false]])],
+    //
+    // go-to-k/cdkd#5630: a CloudFormation update that removes `SourceDestCheck`
+    // sets it back to `true`, the EC2 default, in place (measured us-east-1,
+    // 2026-11-04, a t3.nano: `false` -> removed read back `true`, same instance).
+    [
+      'AWS::EC2::Instance',
+      new Map<string, unknown>([
+        ['Monitoring', false],
+        ['SourceDestCheck', true],
+      ]),
+    ],
   ]);
 
   unhandledByDesign = new Map<string, ReadonlyMap<string, string>>([
@@ -3063,6 +3223,53 @@ export class EC2Provider implements ResourceProvider {
 
   // ─── AWS::EC2::Subnet ─────────────────────────────────────────────
 
+  /** Refuse malformed template values; a state replay keeps the last usable value. */
+  private async prepareSubnetProperties(
+    logicalId: string,
+    resourceType: string,
+    properties: Record<string, unknown>,
+    context?: CreateContext | UpdateContext,
+    physicalId?: string,
+    previousProperties?: Record<string, unknown>
+  ): Promise<Record<string, unknown>> {
+    let prepared = properties;
+    for (const key of ['EnableDns64', 'Ipv6CidrBlock']) {
+      const refusal = (bag: Record<string, unknown>) =>
+        key === 'EnableDns64'
+          ? configBooleanRefusal(bag, key, 'Subnet')
+          : configStringRefusal(bag, key, '<unset>', 'Subnet');
+      const message = refusal(properties);
+      if (message === undefined) continue;
+      if (context?.replayingState !== true) {
+        throw new ProvisioningError(message, resourceType, logicalId, physicalId);
+      }
+      this.logger.warn(
+        safeMsg`${logicalId}: ${message}; leaving ${key} unchanged during state replay`
+      );
+      prepared = { ...prepared };
+      delete prepared[key];
+      if (previousProperties?.[key] !== undefined) {
+        // An absent previous value stays absent. A corrupt recorded value
+        // needs the live baseline rather than a default on an existing subnet.
+        const baseline =
+          refusal(previousProperties) === undefined
+            ? previousProperties
+            : await this.readSubnetCurrentState(physicalId!);
+        if (baseline && baseline !== RESOURCE_NOT_FOUND && baseline[key] !== undefined) {
+          prepared[key] = baseline[key];
+        } else if (baseline === undefined || baseline === RESOURCE_NOT_FOUND) {
+          throw new ProvisioningError(
+            `Cannot read ${key} for Subnet ${logicalId}; retry after DescribeSubnets succeeds`,
+            resourceType,
+            logicalId,
+            physicalId
+          );
+        }
+      }
+    }
+    return prepared;
+  }
+
   private async createSubnet(
     logicalId: string,
     resourceType: string,
@@ -3072,6 +3279,12 @@ export class EC2Provider implements ResourceProvider {
     this.logger.debug(`Creating Subnet ${logicalId}`);
     // go-to-k/cdkd#3994: a malformed Tags is refused before any call.
     const desiredTags = refuseMalformedDesiredTags(properties['Tags'], resourceType, logicalId);
+    const prepared = await this.prepareSubnetProperties(
+      logicalId,
+      resourceType,
+      properties,
+      context
+    );
 
     const vpcId = properties['VpcId'] as string;
     const cidrBlock = properties['CidrBlock'] as string;
@@ -3116,6 +3329,7 @@ export class EC2Provider implements ResourceProvider {
               new CreateSubnetCommand({
                 VpcId: vpcId,
                 CidrBlock: cidrBlock,
+                Ipv6CidrBlock: prepared['Ipv6CidrBlock'] as string | undefined,
                 AvailabilityZone: (properties['AvailabilityZone'] as string) ?? undefined,
                 ...(TagSpecifications && { TagSpecifications }),
               })
@@ -3164,6 +3378,27 @@ export class EC2Provider implements ResourceProvider {
             maskerOrIdentity(context?.maskSecrets)
           );
 
+        // The observed-state capture must not record an associating block as
+        // absent, and DNS64 wiring needs the IPv6 association ready (#5778).
+        if (prepared['Ipv6CidrBlock'] !== undefined) {
+          const associationId = response.Subnet?.Ipv6CidrBlockAssociationSet?.[0]?.AssociationId;
+          if (!associationId) {
+            throw new ProvisioningError(
+              `CreateSubnet returned no IPv6 association ID for ${logicalId}`,
+              resourceType,
+              logicalId,
+              subnetId
+            );
+          }
+          await this.waitForSubnetIpv6Association(
+            logicalId,
+            subnetId,
+            resourceType,
+            associationId,
+            'associated'
+          );
+        }
+
         // Set MapPublicIpOnLaunch if specified
         const mapPublicIp = properties['MapPublicIpOnLaunch'];
         if (mapPublicIp === true || mapPublicIp === 'true') {
@@ -3177,7 +3412,17 @@ export class EC2Provider implements ResourceProvider {
           // deploy engine's async observed-state capture races this modify
           // and would otherwise persist the stale `false` as the drift
           // baseline (phantom drift on every later `cdkd drift`).
-          await this.waitForSubnetMapPublicIp(subnetId, true);
+          await this.waitForSubnetAttribute(subnetId, true);
+        }
+        const dns64 = coerceCfnBoolean(prepared['EnableDns64']);
+        if (dns64 !== undefined) {
+          await this.ec2Client.send(
+            new ModifySubnetAttributeCommand({
+              SubnetId: subnetId,
+              EnableDns64: { Value: dns64 },
+            })
+          );
+          await this.waitForSubnetAttribute(subnetId, dns64, 'EnableDns64');
         }
       } catch (innerError) {
         try {
@@ -3202,6 +3447,7 @@ export class EC2Provider implements ResourceProvider {
 
       return {
         physicalId: subnetId,
+        ...(prepared !== properties && { effectiveProperties: prepared }),
         attributes: {
           SubnetId: subnetId,
           AvailabilityZone: availabilityZone,
@@ -3239,6 +3485,14 @@ export class EC2Provider implements ResourceProvider {
     this.logger.debug(`Updating Subnet ${logicalId}: ${physicalId}`);
     // go-to-k/cdkd#3994: a malformed desired Tags is refused before any call.
     refuseMalformedDesiredTags(properties['Tags'], resourceType, logicalId, physicalId);
+    const prepared = await this.prepareSubnetProperties(
+      logicalId,
+      resourceType,
+      properties,
+      context,
+      physicalId,
+      previousProperties
+    );
 
     try {
       // VpcId / CidrBlock / AvailabilityZone are CREATE-only. The diff layer
@@ -3273,8 +3527,53 @@ export class EC2Provider implements ResourceProvider {
             MapPublicIpOnLaunch: { Value: newMapPublicIp },
           })
         );
-        await this.waitForSubnetMapPublicIp(physicalId, newMapPublicIp);
+        await this.waitForSubnetAttribute(physicalId, newMapPublicIp);
       }
+
+      // CloudFormation preserves DNS64 when the property is removed (#5632).
+      const dns64 = coerceCfnBoolean(prepared['EnableDns64']);
+      const keptDns64 = prepared['EnableDns64'] !== properties['EnableDns64'];
+      let previousDns64 = coerceCfnBoolean(previousProperties['EnableDns64']);
+      if (!keptDns64 && dns64 !== undefined && context?.unsettledProperties?.has('EnableDns64')) {
+        const live = await this.readSubnetCurrentState(physicalId, new Set(['EnableDns64']));
+        if (live === RESOURCE_NOT_FOUND || live === undefined) {
+          throw new ProvisioningError(
+            'Subnet was not returned by DescribeSubnets; retry the subnet read',
+            resourceType,
+            logicalId,
+            physicalId
+          );
+        }
+        previousDns64 = live['EnableDns64'] as boolean;
+      }
+      const changedDns64 = !keptDns64 && dns64 !== undefined && dns64 !== previousDns64;
+      const applyDns64 = async (value: boolean): Promise<void> => {
+        context?.markUnsettled?.('EnableDns64');
+        await this.ec2Client.send(
+          new ModifySubnetAttributeCommand({ SubnetId: physicalId, EnableDns64: { Value: value } })
+        );
+        await this.waitForSubnetAttribute(physicalId, value, 'EnableDns64');
+      };
+      // Disable first; enabling requires the new IPv6 association ready.
+      if (changedDns64 && dns64 === false) await applyDns64(false);
+
+      // A replay-skipped field retains its baseline without issuing a write.
+      const keptIpv6 = prepared['Ipv6CidrBlock'] !== properties['Ipv6CidrBlock'];
+      if (
+        !keptIpv6 &&
+        (prepared['Ipv6CidrBlock'] !== previousProperties['Ipv6CidrBlock'] ||
+          context?.unsettledProperties?.has('Ipv6CidrBlock'))
+      ) {
+        await this.updateSubnetIpv6CidrBlock(
+          logicalId,
+          physicalId,
+          resourceType,
+          prepared['Ipv6CidrBlock'] as string | undefined,
+          true,
+          context?.markUnsettled
+        );
+      }
+      if (changedDns64 && dns64 === true) await applyDns64(true);
 
       // Update tags (diff add/remove against previousProperties)
       await this.applyTagDiff(
@@ -3295,6 +3594,7 @@ export class EC2Provider implements ResourceProvider {
       return {
         physicalId,
         wasReplaced: false,
+        ...(prepared !== properties && { effectiveProperties: prepared }),
       };
     } catch (error) {
       if (error instanceof CdkdError) throw error;
@@ -3314,8 +3614,185 @@ export class EC2Provider implements ResourceProvider {
     }
   }
 
+  private async updateSubnetIpv6CidrBlock(
+    logicalId: string,
+    physicalId: string,
+    resourceType: string,
+    desired: string | undefined,
+    recoverOnFailure = true,
+    markUnsettled?: UpdateContext['markUnsettled']
+  ): Promise<void> {
+    let response = await this.ec2Client.send(
+      new DescribeSubnetsCommand({ SubnetIds: [physicalId] })
+    );
+    let subnet = response.Subnets?.[0];
+    // A previous attempt may have stopped while AWS was still changing the
+    // association. Settle that attempt before choosing what to detach/attach.
+    for (const pending of subnet?.Ipv6CidrBlockAssociationSet ?? []) {
+      const state = pending.Ipv6CidrBlockState?.State;
+      if (pending.AssociationId && (state === 'associating' || state === 'disassociating')) {
+        await this.waitForSubnetIpv6Association(
+          logicalId,
+          physicalId,
+          resourceType,
+          pending.AssociationId,
+          state === 'associating' ? 'associated' : 'disassociated'
+        );
+        response = await this.ec2Client.send(
+          new DescribeSubnetsCommand({ SubnetIds: [physicalId] })
+        );
+        subnet = response.Subnets?.[0];
+      }
+    }
+    if (!subnet) {
+      throw new ProvisioningError(
+        `Subnet ${logicalId} was not returned by DescribeSubnets`,
+        resourceType,
+        logicalId,
+        physicalId
+      );
+    }
+    // Old disassociated entries remain in this array. Never use its first item.
+    const current = subnet.Ipv6CidrBlockAssociationSet?.find(
+      (association) => association.Ipv6CidrBlockState?.State === 'associated'
+    );
+    if (current?.Ipv6CidrBlock === desired) return;
+    const currentCidr = current?.Ipv6CidrBlock;
+    const canonicalCurrent =
+      currentCidr === undefined ? undefined : canonicalizeIpv6Cidr(currentCidr);
+    if (
+      canonicalCurrent !== undefined &&
+      desired !== undefined &&
+      canonicalCurrent === canonicalizeIpv6Cidr(desired)
+    )
+      return;
+    try {
+      if (current) {
+        if (!current.AssociationId) {
+          throw new ProvisioningError(
+            `Subnet ${logicalId} has no IPv6 association ID; retry DescribeSubnets`,
+            resourceType,
+            logicalId,
+            physicalId
+          );
+        }
+        markUnsettled?.('Ipv6CidrBlock');
+        await this.ec2Client.send(
+          new DisassociateSubnetCidrBlockCommand({ AssociationId: current.AssociationId })
+        );
+        await this.waitForSubnetIpv6Association(
+          logicalId,
+          physicalId,
+          resourceType,
+          current.AssociationId,
+          'disassociated'
+        );
+      }
+      if (desired !== undefined) {
+        markUnsettled?.('Ipv6CidrBlock');
+        const associated = await this.ec2Client.send(
+          new AssociateSubnetCidrBlockCommand({
+            SubnetId: physicalId,
+            Ipv6CidrBlock: desired,
+          })
+        );
+        const associationId = associated.Ipv6CidrBlockAssociation?.AssociationId;
+        if (!associationId) {
+          throw new ProvisioningError(
+            `AssociateSubnetCidrBlock returned no association ID for ${logicalId}`,
+            resourceType,
+            logicalId,
+            physicalId
+          );
+        }
+        await this.waitForSubnetIpv6Association(
+          logicalId,
+          physicalId,
+          resourceType,
+          associationId,
+          'associated'
+        );
+      }
+    } catch (error) {
+      // A failed attach must not silently leave the old record on a subnet
+      // with no IPv6 block. Recover only the live block this call detached.
+      if (
+        current?.Ipv6CidrBlock !== undefined &&
+        recoverOnFailure &&
+        !isInterruptedWaitError(error) &&
+        !enclosingDeadlineExpired()
+      ) {
+        try {
+          await this.updateSubnetIpv6CidrBlock(
+            logicalId,
+            physicalId,
+            resourceType,
+            current.Ipv6CidrBlock,
+            false,
+            markUnsettled
+          );
+        } catch {
+          this.logger.warn(
+            safeMsg`Subnet ${logicalId}: IPv6 association recovery failed; inspect DescribeSubnets and redeploy before using the subnet`
+          );
+        }
+      }
+      throw error;
+    }
+  }
+
+  /** Association changes are asynchronous; a new block cannot overlap the old one. */
+  private async waitForSubnetIpv6Association(
+    logicalId: string,
+    physicalId: string,
+    resourceType: string,
+    associationId: string,
+    target: 'associated' | 'disassociated'
+  ): Promise<void> {
+    const watch = startInterruptWatch(`Subnet ${logicalId} IPv6 association wait`);
+    try {
+      for (let attempt = 0; attempt < 30; attempt++) {
+        if (watch.isInterrupted()) throw watch.onInterrupted();
+        if (enclosingDeadlineExpired()) break;
+        const response = await this.ec2Client.send(
+          new DescribeSubnetsCommand({ SubnetIds: [physicalId] })
+        );
+        const subnet = response.Subnets?.[0];
+        const association = subnet?.Ipv6CidrBlockAssociationSet?.find(
+          (item) => item.AssociationId === associationId
+        );
+        const state = association?.Ipv6CidrBlockState?.State;
+        if (
+          subnet &&
+          (state === target || (target === 'disassociated' && association === undefined))
+        )
+          return;
+        if (state === 'failed' || state === 'failing') {
+          throw new ProvisioningError(
+            `IPv6 association change failed for Subnet ${logicalId}; inspect DescribeSubnets`,
+            resourceType,
+            logicalId,
+            physicalId
+          );
+        }
+        if (attempt < 29)
+          await this.sleep(Math.max(0, Math.min(1000, enclosingDeadlineRemainingMs())));
+      }
+      throw markNonRetryable(
+        new ProvisioningError(
+          `Timed out waiting for Subnet ${logicalId} IPv6 association to be ${target}; inspect DescribeSubnets before retrying`,
+          resourceType,
+          logicalId,
+          physicalId
+        )
+      );
+    } finally {
+      watch.dispose();
+    }
+  }
+
   /**
-   * Read back `MapPublicIpOnLaunch` until AWS reflects the value a
+   * Read back a subnet attribute until AWS reflects the value a
    * `ModifySubnetAttribute` just wrote (issue #1299). EC2 `Describe*` is
    * eventually consistent, so the deploy engine's async observed-state
    * capture (`kickOffObservedCapture` → `readCurrentState` →
@@ -3329,17 +3806,21 @@ export class EC2Provider implements ResourceProvider {
    * exhaustion we log and return — behavior then degrades to the pre-fix
    * race instead of failing a deploy over a read-side consistency lag.
    */
-  private async waitForSubnetMapPublicIp(subnetId: string, expected: boolean): Promise<void> {
+  private async waitForSubnetAttribute(
+    subnetId: string,
+    expected: boolean,
+    attribute: 'MapPublicIpOnLaunch' | 'EnableDns64' = 'MapPublicIpOnLaunch'
+  ): Promise<void> {
     const maxAttempts = 6;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
         const resp = await this.ec2Client.send(
           new DescribeSubnetsCommand({ SubnetIds: [subnetId] })
         );
-        if (resp.Subnets?.[0]?.MapPublicIpOnLaunch === expected) return;
+        if (resp.Subnets?.[0]?.[attribute] === expected) return;
       } catch (error) {
         this.logger.debug(
-          `MapPublicIpOnLaunch read-back for ${subnetId} failed (attempt ${attempt}/${maxAttempts}): ${describeAwsFailure(error).detail}`
+          `${attribute} read-back for ${subnetId} failed (attempt ${attempt}/${maxAttempts}): ${describeAwsFailure(error).detail}`
         );
         return;
       }
@@ -3348,7 +3829,7 @@ export class EC2Provider implements ResourceProvider {
       }
     }
     this.logger.debug(
-      `MapPublicIpOnLaunch=${expected} not yet visible on ${subnetId} after ${maxAttempts} reads — the observed-state capture may record the stale value`
+      `${attribute} update not yet visible on ${subnetId} after ${maxAttempts} reads — the observed-state capture may record the stale value`
     );
   }
 
@@ -7869,6 +8350,13 @@ export class EC2Provider implements ResourceProvider {
         logicalId,
       });
 
+      // go-to-k/cdkd#5630: `PropagateTagsToVolumeOnCreation` gives the volumes
+      // RunInstances creates the instance's tags. CloudFormation applies them
+      // at launch only: a later Tags change, or removing the flag, leaves the
+      // volume tags as they are (measured us-east-1, 2026-11-04), so update()
+      // sends nothing for it.
+      const propagateToVolumes =
+        coerceCfnBoolean(properties['PropagateTagsToVolumeOnCreation']) === true;
       const { response, tagsApplied } = await this.sendTaggedCreate(
         logicalId,
         'instance',
@@ -7876,7 +8364,17 @@ export class EC2Provider implements ResourceProvider {
         (TagSpecifications) =>
           this.ec2Client.send(
             new RunInstancesCommand({
-              ...(TagSpecifications && { TagSpecifications }),
+              ...(TagSpecifications && {
+                TagSpecifications: propagateToVolumes
+                  ? [
+                      ...TagSpecifications,
+                      ...TagSpecifications.map((spec) => ({
+                        ...spec,
+                        ResourceType: 'volume' as const,
+                      })),
+                    ]
+                  : TagSpecifications,
+              }),
               ClientToken: runInstancesToken.value,
               ImageId: imageId,
               InstanceType: instanceType as _InstanceType,
@@ -7951,13 +8449,18 @@ export class EC2Provider implements ResourceProvider {
       // termination via `aws ec2 describe-instances` if cleanup itself
       // failed.
       try {
-        // Apply tags the create did not carry (go-to-k/cdkd#4971)
+        // Apply tags the create did not carry (go-to-k/cdkd#4971). The
+        // CreateTags goes to the instance RunInstances just returned, so it
+        // retries an eventually-consistent not-found too (go-to-k/cdkd#5630):
+        // applyTags only warns on a failure, which would leave the instance
+        // untagged while state records the declared tags.
         if (!tagsApplied)
           await this.applyTags(
             instanceId,
             desiredTags,
             logicalId,
-            maskerOrIdentity(context?.maskSecrets)
+            maskerOrIdentity(context?.maskSecrets),
+            (call) => this.whileLaunchedInstanceNotVisible(logicalId, instanceId, call)
           );
 
         // Wait for instance to reach running state unless --no-wait is set.
@@ -8060,14 +8563,52 @@ export class EC2Provider implements ResourceProvider {
           }
         }
 
+        // go-to-k/cdkd#5630: RunInstances has no SourceDestCheck input, so a
+        // declared `false` is set on the launched instance, as CloudFormation
+        // does. `true` is EC2's default and needs no call.
+        if (coerceCfnBoolean(properties['SourceDestCheck']) === false) {
+          await this.whileLaunchedInstanceNotVisible(logicalId, instanceId, () =>
+            this.ec2Client.send(
+              new ModifyInstanceAttributeCommand({
+                InstanceId: instanceId,
+                SourceDestCheck: { Value: false },
+              })
+            )
+          );
+        }
+
         // Describe instance to get attributes after running. Under
         // --no-wait the instance can still be `pending` here, so the public
         // address may not be assigned yet; `describedInstanceAttributes`
         // records what is KNOWN and omits what is not (issue #3077).
-        const describeResponse = await this.ec2Client.send(
-          new DescribeInstancesCommand({ InstanceIds: [instanceId] })
+        const describeResponse = await this.whileLaunchedInstanceNotVisible(
+          logicalId,
+          instanceId,
+          () => this.ec2Client.send(new DescribeInstancesCommand({ InstanceIds: [instanceId] }))
         );
         const runningInstance = describeResponse.Reservations?.[0]?.Instances?.[0];
+
+        // go-to-k/cdkd#5630: the launch went out without TagSpecifications
+        // (sendTaggedCreate's untagged re-send), so the volumes did not get
+        // the tags either: apply them to the attached volumes now.
+        if (propagateToVolumes && !tagsApplied && desiredTags.length > 0) {
+          const volumeIds = (runningInstance?.BlockDeviceMappings ?? [])
+            .map((m) => m.Ebs?.VolumeId)
+            .filter((id): id is string => typeof id === 'string' && id !== '');
+          if (volumeIds.length === 0) {
+            this.logger.warn(
+              safeMsg`${logicalId}: PropagateTagsToVolumeOnCreation is set, but the launch went out without tags (the tagged RunInstances was refused) and DescribeInstances reported no attached volume for ${instanceId} yet (under --no-wait the instance may still be pending), so its volumes were not tagged. Tag them with ec2:CreateTags once they are attached.`
+            );
+          }
+          for (const volumeId of volumeIds) {
+            await this.applyTags(
+              volumeId,
+              desiredTags,
+              logicalId,
+              maskerOrIdentity(context?.maskSecrets)
+            );
+          }
+        }
 
         const attributes = describedInstanceAttributes(instanceId, runningInstance);
 
@@ -8582,6 +9123,24 @@ export class EC2Provider implements ResourceProvider {
    *  - `InstanceInitiatedShutdownBehavior` (go-to-k/cdkd#5630, measured
    *    2026-11-04): in place, no interruption; a removal FAILS the update, so
    *    it is refused here.
+   *  - `SourceDestCheck` (go-to-k/cdkd#5630, measured 2026-11-04): in place,
+   *    no interruption; a removal sets it back to `true`.
+   *  - `PlacementGroupName`, `PrivateIpAddress` (go-to-k/cdkd#5630): any
+   *    change, a removal or an addition replaces the instance, so only
+   *    `cdkd drift --revert` brings one here, where it is refused.
+   *  - `Tenancy` (go-to-k/cdkd#5630): a recorded value changed to or from
+   *    `default` (a removal included) replaces. A value the record lacks is
+   *    compared with the live tenancy (no call when it matches, refused when
+   *    not); a `dedicated` <-> `host` change is unmeasured and refused.
+   *  - `PropagateTagsToVolumeOnCreation` (go-to-k/cdkd#5630, measured
+   *    2026-11-04): applied at launch only; a change sends nothing.
+   *  - `AdditionalInfo` (go-to-k/cdkd#5630, measured 2026-11-04): adding it
+   *    to a running instance completes with no change, so a change sends
+   *    nothing (EC2 refuses it at launch).
+   *  - `Ipv6AddressCount`, `Ipv6Addresses` (go-to-k/cdkd#5630): create-only,
+   *    like `PrivateIpAddress`.
+   *  - `PrivateDnsNameOptions` (go-to-k/cdkd#5630, measured 2026-11-04): see
+   *    `planPrivateDnsNameOptions`; a HostnameType change stops and starts.
    *
    * A member is CHANGED per the engine's `changedProperties` when it is set
    * (a redacted state value cannot be compared to a resolved one), else per
@@ -8679,11 +9238,11 @@ export class EC2Provider implements ResourceProvider {
       }
     }
 
-    // CpuOptions / HibernationOptions (go-to-k/cdkd#5630): create-only, so the
-    // engine replaces the instance on a change and only `cdkd drift --revert`
-    // brings one here. AWS has no call that changes them on a running
-    // instance, so the update is refused before any call rather than reported
-    // as reverted.
+    // CpuOptions / HibernationOptions / PlacementGroupName / PrivateIpAddress /
+    // Tenancy (go-to-k/cdkd#5630): the engine replaces the instance on a
+    // change, as CloudFormation does, and only `cdkd drift --revert` brings
+    // one here. None changes on a running instance, so the update is refused
+    // before any call rather than reported as reverted.
     const createOnlyChanged = INSTANCE_CREATE_ONLY_SENT.filter((key) =>
       changed(key, (a, b) => sameCreateOnlySent(key, a, b))
     );
@@ -8695,6 +9254,73 @@ export class EC2Provider implements ResourceProvider {
           `replace the instance (cdkd deploy --replace). ${createOnlyChanged.join(', ')} can be set only when the instance is launched, and CloudFormation creates a new instance for this change`
         )
       );
+    }
+
+    // Tenancy (go-to-k/cdkd#5630; `instanceTenancyChangeReplaces` decides
+    // which changes the engine replaces for).
+    if (changed('Tenancy', (a, b) => a === b) && !standInSkips('Tenancy')) {
+      const before = previousProperties['Tenancy'];
+      const after = properties['Tenancy'];
+      const refusal = configStringRefusal(properties, 'Tenancy', '', resourceType);
+      if (refusal !== undefined) {
+        throw refusedBeforeApplying(
+          new ProvisioningError(
+            `${refusal}. The instance ${logicalId} was not updated.`,
+            resourceType,
+            logicalId,
+            physicalId
+          )
+        );
+      }
+      if (before == null && typeof after === 'string') {
+        // The record lacks it: an earlier cdkd under --prefer-sdk-route
+        // dropped a declared Tenancy, so AWS may already hold this value.
+        // Checked against the live tenancy before any mutating call.
+        plan.tenancyAddition = { value: after, replaying: context?.replayingState === true };
+      } else if (
+        typeof before === 'string' &&
+        typeof after === 'string' &&
+        before !== 'default' &&
+        after !== 'default'
+      ) {
+        // UNMEASURED: a change between two non-default tenancies
+        // (dedicated <-> host) needs a Dedicated Host to measure.
+        // CloudFormation may apply it in place (a stop and
+        // ModifyInstancePlacement) rather than replace, so cdkd neither
+        // replaces nor applies it.
+        if (context?.replayingState === true) {
+          this.logger.warn(
+            safeMsg`${logicalId} (${resourceType}): the rollback would change Tenancy ${before} -> ${after}, which cdkd does not apply; the instance keeps its current tenancy.`
+          );
+        } else {
+          throw refusedBeforeApplying(
+            new ResourceUpdateNotSupportedError(
+              resourceType,
+              logicalId,
+              safeMsg`cdkd does not change Tenancy ${before} -> ${after}. How CloudFormation applies a change between two non-default tenancies has not been measured (it may stop the instance and move it rather than replace it), so cdkd neither replaces the instance nor applies the change. Keep the current tenancy, or replace the instance explicitly with cdkd deploy --replace`
+            )
+          );
+        }
+      } else if (context?.replayingState === true) {
+        // A rollback revert: a record that adopted Tenancy on the failed
+        // deploy carries it on the previous side and not on the desired one,
+        // so the revert reads it as a removal. Leave the tenancy and revert
+        // the other members.
+        this.logger.warn(
+          safeMsg`${logicalId} (${resourceType}): the rollback would change Tenancy (${before === undefined ? 'unset' : before} -> ${after === undefined ? 'unset' : after}), which needs a new instance; the instance keeps its current tenancy.`
+        );
+      } else {
+        // To or from `default`, or a removal: the engine replaces the instance,
+        // as CloudFormation does, so only `cdkd drift --revert` (or a direct
+        // call) brings one here. No call changes it on a running instance.
+        throw refusedBeforeApplying(
+          new ResourceUpdateNotSupportedError(
+            resourceType,
+            logicalId,
+            'replace the instance (cdkd deploy --replace). CloudFormation creates a new instance for a Tenancy change to or from default'
+          )
+        );
+      }
     }
 
     // InstanceInitiatedShutdownBehavior (go-to-k/cdkd#5630): CloudFormation
@@ -8725,6 +9351,53 @@ export class EC2Provider implements ResourceProvider {
         );
       }
     }
+
+    // SourceDestCheck (go-to-k/cdkd#5630): CloudFormation changes it in place
+    // with no interruption, and a removal sets it back to `true` (measured
+    // us-east-1, 2026-11-04); the engine hands a removal over as the `true`
+    // from `removalDefaults`, and a direct call's bare removal means the same.
+    // An absent side is the default `true`; a malformed one is no boolean, so
+    // it never compares equal to a readable side and reaches the refusal.
+    const sourceDestCheckOf = (v: unknown): boolean | undefined =>
+      v === undefined ? true : coerceCfnBoolean(v);
+    if (
+      changed('SourceDestCheck', (a, b) => sourceDestCheckOf(a) === sourceDestCheckOf(b)) &&
+      !standInSkips('SourceDestCheck')
+    ) {
+      const raw = properties['SourceDestCheck'];
+      const want = raw === undefined ? true : coerceCfnBoolean(raw);
+      if (want === undefined) {
+        const refusal = configBooleanRefusal(properties, 'SourceDestCheck', resourceType);
+        if (context?.replayingState === true || context?.desiredFromAwsReadback === true) {
+          this.logger.warn(
+            safeMsg`${logicalId} (${resourceType}): ${refusal ?? 'SourceDestCheck is not a boolean'}; it is left at its current AWS value.`
+          );
+        } else {
+          throw refusedBeforeApplying(
+            new ProvisioningError(
+              `${refusal ?? `${resourceType}.SourceDestCheck must be a boolean`}. The instance ${logicalId} was not updated.`,
+              resourceType,
+              logicalId,
+              physicalId
+            )
+          );
+        }
+      } else {
+        plan.sourceDestCheck = want;
+      }
+    }
+
+    this.planPrivateDnsNameOptions(
+      logicalId,
+      physicalId,
+      resourceType,
+      properties,
+      previousProperties,
+      context,
+      plan,
+      changed,
+      standInSkips
+    );
 
     // UserData: a removal clears it.
     if (changed('UserData', (a, b) => a === b)) {
@@ -8829,6 +9502,126 @@ export class EC2Provider implements ResourceProvider {
   }
 
   /**
+   * go-to-k/cdkd#5630: plan a `PrivateDnsNameOptions` change. What
+   * CloudFormation does, MEASURED (us-east-1, 2026-11-04, a t3.nano):
+   *  - adding the block, or changing a member, keeps the instance:
+   *    ModifyPrivateDnsNameOptions with the changed members, the
+   *    `EnableResourceName*` flags in place, a `HostnameType` change with a
+   *    stop and a start (EC2 refuses any HostnameType on a running instance,
+   *    "Cannot modify hostname-type for running instances", even an unchanged
+   *    one);
+   *  - removing the whole block creates a new instance
+   *    (`instancePrivateDnsNameOptionsChangeReplaces`), so only
+   *    `cdkd drift --revert` or a direct call brings one here, where it is
+   *    refused;
+   *  - removing a member FAILS the update ("No valid attributes specified"),
+   *    whether or not another member changes with it (three shapes measured),
+   *    so it is refused here.
+   *
+   * A rollback revert keeps the live value and warns instead of refusing.
+   */
+  private planPrivateDnsNameOptions(
+    logicalId: string,
+    physicalId: string,
+    resourceType: string,
+    properties: Record<string, unknown>,
+    previousProperties: Record<string, unknown>,
+    context: UpdateContext | undefined,
+    plan: InstanceMemberPlan,
+    changed: (key: string, same: (a: unknown, b: unknown) => boolean) => boolean,
+    standInSkips: (key: string) => boolean
+  ): void {
+    const KEY = 'PrivateDnsNameOptions';
+    const readable = (v: unknown): PrivateDnsNameOptionsRequest =>
+      v != null && privateDnsNameOptionsRefusal(v, resourceType) === undefined
+        ? (privateDnsNameOptionsRequest(v) ?? {})
+        : {};
+    const sameOptions = (a: unknown, b: unknown): boolean =>
+      a != null &&
+      b != null &&
+      privateDnsNameOptionsRefusal(a, resourceType) === undefined &&
+      privateDnsNameOptionsRefusal(b, resourceType) === undefined &&
+      isDeepStrictEqual(readable(a), readable(b));
+    if (!changed(KEY, sameOptions)) return;
+    const replaying = context?.replayingState === true;
+    const after = properties[KEY];
+    if (after === undefined || after === null) {
+      if (replaying) {
+        this.logger.warn(
+          safeMsg`${logicalId} (${resourceType}): the state being restored does not declare PrivateDnsNameOptions, which needs a new instance; the rollback leaves the instance's hostname options as they are.`
+        );
+        return;
+      }
+      throw refusedBeforeApplying(
+        new ResourceUpdateNotSupportedError(
+          resourceType,
+          logicalId,
+          'replace the instance (cdkd deploy --replace). CloudFormation creates a new instance when PrivateDnsNameOptions is removed'
+        )
+      );
+    }
+    if (standInSkips(KEY)) return;
+    const refusal = privateDnsNameOptionsRefusal(after, resourceType);
+    if (refusal !== undefined) {
+      if (replaying || context?.desiredFromAwsReadback === true) {
+        this.logger.warn(
+          safeMsg`${logicalId} (${resourceType}): ${refusal}; the hostname options are left at their current AWS value.`
+        );
+        return;
+      }
+      throw refusedBeforeApplying(
+        new ProvisioningError(
+          `${refusal}. The instance ${logicalId} was not updated.`,
+          resourceType,
+          logicalId,
+          physicalId
+        )
+      );
+    }
+    const want = readable(after);
+    const had = readable(previousProperties[KEY]);
+    const request: NonNullable<InstanceMemberPlan['privateDnsNameOptions']> = {};
+    if (want.HostnameType !== undefined && want.HostnameType !== had.HostnameType) {
+      request.PrivateDnsHostnameType = want.HostnameType;
+    }
+    for (const member of [
+      'EnableResourceNameDnsARecord',
+      'EnableResourceNameDnsAAAARecord',
+    ] as const) {
+      if (want[member] !== undefined && want[member] !== had[member]) {
+        request[member] = want[member];
+      }
+    }
+    // A removed member. Every one CloudFormation was MEASURED on fails the
+    // update ("No valid attributes specified"), alone or next to a changed
+    // member, and leaves the instance as it was, so it is refused before any
+    // call. A `cdkd drift --revert` previous side is the readback, which
+    // reports every member, so a member the record omits is no removal there.
+    const removedMembers =
+      context?.desiredFromAwsReadback === true
+        ? ''
+        : (Object.keys(had) as Array<keyof PrivateDnsNameOptionsRequest>)
+            .filter((m) => want[m] === undefined)
+            .join(', ');
+    if (removedMembers !== '') {
+      if (!replaying) {
+        throw refusedBeforeApplying(
+          new ProvisioningError(
+            safeMsg`${logicalId} (${resourceType}): PrivateDnsNameOptions ${removedMembers} was removed from the template, and CloudFormation fails that update ("No valid attributes specified"). Keep it declared (set it to the value the instance has to leave it unchanged), or remove the whole PrivateDnsNameOptions block, which replaces the instance. The instance was not updated.`,
+            resourceType,
+            logicalId,
+            physicalId
+          )
+        );
+      }
+      this.logger.warn(
+        safeMsg`${logicalId} (${resourceType}): the state being restored does not declare PrivateDnsNameOptions ${removedMembers}; the rollback leaves it at its current AWS value.`
+      );
+    }
+    if (Object.keys(request).length > 0) plan.privateDnsNameOptions = request;
+  }
+
+  /**
    * Issue #5446: the reads and refusals that need AWS, before any mutating
    * call of the update. An InstanceType / UserData change needs a stop: an
    * instance-store-backed instance cannot be stopped (CloudFormation replaces
@@ -8844,26 +9637,59 @@ export class EC2Provider implements ResourceProvider {
     resourceType: string,
     plan: InstanceMemberPlan
   ): Promise<void> {
-    const needsStop = plan.instanceType !== undefined || plan.userData !== undefined;
     const needsDefaultGroup = plan.securityGroups?.kind === 'vpc-default';
-    if (!needsStop && !needsDefaultGroup) return;
+    const tenancy = plan.tenancyAddition;
+    if (instanceStopMembers(plan).length === 0 && !needsDefaultGroup && tenancy === undefined) {
+      return;
+    }
     const resp = await this.ec2Client.send(
       new DescribeInstancesCommand({ InstanceIds: [physicalId] })
     );
     const instance = resp.Reservations?.[0]?.Instances?.[0];
+    // go-to-k/cdkd#5630: EC2 takes a HostnameType only on a stopped instance,
+    // even an unchanged one, so one the instance already has is not sent and
+    // costs no stop (a record that lacked it, or an earlier failed update).
+    const dns = plan.privateDnsNameOptions;
+    if (
+      dns?.PrivateDnsHostnameType !== undefined &&
+      instance?.PrivateDnsNameOptions?.HostnameType === dns.PrivateDnsHostnameType
+    ) {
+      const { PrivateDnsHostnameType: _sameAsLive, ...rest } = dns;
+      if (Object.keys(rest).length > 0) plan.privateDnsNameOptions = rest;
+      else delete plan.privateDnsNameOptions;
+    }
+    const stopMembers = instanceStopMembers(plan);
+    const needsStop = stopMembers.length > 0;
+    if (tenancy !== undefined) {
+      // go-to-k/cdkd#5630: AWS already holding the declared tenancy means
+      // nothing to do (the record then takes the template's value). Anything
+      // else needs a new instance, which is the user's call: a record without
+      // Tenancy cannot say whether the template just added it.
+      const live = instance?.Placement?.Tenancy;
+      if (live !== tenancy.value) {
+        if (tenancy.replaying) {
+          this.logger.warn(
+            safeMsg`${logicalId} (${resourceType}): the state being restored declares Tenancy ${tenancy.value}, but the instance has ${live ?? 'an unreadable tenancy'}; the rollback leaves it as it is.`
+          );
+        } else {
+          throw markRefusedBeforeApplying(
+            new ResourceUpdateNotSupportedError(
+              resourceType,
+              logicalId,
+              safeMsg`the template declares Tenancy ${tenancy.value}, the instance has ${live ?? 'a tenancy DescribeInstances did not report'}, and the state record does not say which tenancy it was launched with. Changing it needs a new instance: replace it with cdkd deploy --replace, or declare Tenancy ${live ?? 'as the instance has it'}`
+            )
+          );
+        }
+      }
+    }
     if (needsStop) {
-      const members = [
-        plan.instanceType !== undefined ? 'InstanceType' : '',
-        plan.userData !== undefined ? 'UserData' : '',
-      ]
-        .filter(Boolean)
-        .join(' and ');
+      const members = stopMembers.join(' and ');
       if (instance?.RootDeviceType === 'instance-store') {
         throw markRefusedBeforeApplying(
           new ResourceUpdateNotSupportedError(
             resourceType,
             logicalId,
-            `${members} can change only on a stopped instance, and an instance-store-backed instance cannot be stopped; CloudFormation replaces it. Re-deploy with cdkd deploy --replace.`
+            `${members} can change only on a stopped instance, and an instance-store-backed instance cannot be stopped; ${plan.instanceType !== undefined || plan.userData !== undefined ? 'CloudFormation replaces it' : 'it needs a new instance'}. Re-deploy with cdkd deploy --replace.`
           )
         );
       }
@@ -8962,7 +9788,29 @@ export class EC2Provider implements ResourceProvider {
       applied.push('the new InstanceInitiatedShutdownBehavior');
     }
 
-    if (plan.instanceType === undefined && plan.userData === undefined) {
+    if (plan.sourceDestCheck !== undefined) {
+      await this.ec2Client.send(
+        new ModifyInstanceAttributeCommand({
+          InstanceId: physicalId,
+          SourceDestCheck: { Value: plan.sourceDestCheck },
+        })
+      );
+      applied.push('the new SourceDestCheck');
+    }
+
+    // go-to-k/cdkd#5630: the EnableResourceName* flags change on a running
+    // instance; a HostnameType goes out with them in the stopped window below.
+    const dns = plan.privateDnsNameOptions;
+    if (dns !== undefined && dns.PrivateDnsHostnameType === undefined) {
+      await this.ec2Client.send(
+        new ModifyPrivateDnsNameOptionsCommand({ InstanceId: physicalId, ...dns })
+      );
+      applied.push('the new PrivateDnsNameOptions');
+    }
+
+    const stopMembers = instanceStopMembers(plan);
+    const stopWhat = stopMembers.join(' / ');
+    if (stopMembers.length === 0) {
       // An instance cdkd stopped and could not start again earlier in this
       // process (a rollback whose only stop member was skipped) is started,
       // once it has finished stopping; one already running is left alone.
@@ -8988,7 +9836,7 @@ export class EC2Provider implements ResourceProvider {
     if (state !== 'stopped' && state !== 'running') {
       throw markNonRetryable(
         new ProvisioningError(
-          `${logicalId} (${resourceType}): instance ${physicalId} became ${state ?? 'not returned by DescribeInstances'} during the update, so its InstanceType / UserData were not changed`,
+          `${logicalId} (${resourceType}): instance ${physicalId} became ${state ?? 'not returned by DescribeInstances'} during the update, so its ${stopWhat} were not changed`,
           resourceType,
           logicalId,
           physicalId
@@ -9002,7 +9850,7 @@ export class EC2Provider implements ResourceProvider {
     try {
       if (state === 'running') {
         this.logger.info(
-          safeMsg`Stopping EC2 Instance ${logicalId} (${physicalId}) to change its ${plan.instanceType !== undefined ? 'InstanceType' : ''}${plan.instanceType !== undefined && plan.userData !== undefined ? ' and ' : ''}${plan.userData !== undefined ? 'UserData' : ''}; it is started again afterwards`
+          safeMsg`Stopping EC2 Instance ${logicalId} (${physicalId}) to change its ${stopMembers.join(' and ')}; it is started again afterwards`
         );
         await this.ec2Client.send(new StopInstancesCommand({ InstanceIds: [physicalId] }));
         stopIssued = true;
@@ -9026,6 +9874,12 @@ export class EC2Provider implements ResourceProvider {
           })
         );
         applied.push('the new UserData');
+      }
+      if (dns?.PrivateDnsHostnameType !== undefined) {
+        await this.ec2Client.send(
+          new ModifyPrivateDnsNameOptionsCommand({ InstanceId: physicalId, ...dns })
+        );
+        applied.push('the new PrivateDnsNameOptions');
       }
       if (!startAfter) return;
       phase = 'start';
@@ -9071,12 +9925,12 @@ export class EC2Provider implements ResourceProvider {
         if (startFailure === undefined) {
           instancesLeftStoppedByCdkd.delete(physicalId);
           this.logger.warn(
-            safeMsg`${logicalId}: the InstanceType / UserData change failed after instance ${physicalId} was stopped; cdkd started it again, with ${carries}.`
+            safeMsg`${logicalId}: the ${stopWhat} change failed after instance ${physicalId} was stopped; cdkd started it again, with ${carries}.`
           );
         } else {
           instancesLeftStoppedByCdkd.add(physicalId);
           this.logger.warn(
-            safeMsg`${logicalId}: instance ${physicalId} was stopped for an InstanceType / UserData change that failed, and starting it again failed too (${describeAwsFailure(startFailure).summary}); it is stopped, with ${carries}. Start it with: ${startCommand}`
+            safeMsg`${logicalId}: instance ${physicalId} was stopped for a ${stopWhat} change that failed, and starting it again failed too (${describeAwsFailure(startFailure).summary}); it is stopped, with ${carries}. Start it with: ${startCommand}`
           );
         }
         throw error;
@@ -9084,7 +9938,7 @@ export class EC2Provider implements ResourceProvider {
       instancesLeftStoppedByCdkd.add(physicalId);
       this.logger.warn(
         phase === 'stop'
-          ? safeMsg`${logicalId}: instance ${physicalId} was being stopped for an InstanceType / UserData change that did not finish. Once it is stopped, start it with: ${startCommand}`
+          ? safeMsg`${logicalId}: instance ${physicalId} was being stopped for a ${stopWhat} change that did not finish. Once it is stopped, start it with: ${startCommand}`
           : safeMsg`${logicalId}: instance ${physicalId} is stopped, with ${carries}; cdkd did not start it again. Start it with: ${startCommand}`
       );
       throw error;
@@ -9634,18 +10488,24 @@ export class EC2Provider implements ResourceProvider {
    * omitted entirely -- an empty `Placement: {}` would be a pointless
    * shape change on every instance that does not set the property.
    *
-   * Only AvailabilityZone is mapped. The other `Placement` members
-   * (Tenancy, GroupName, HostId, Affinity, PartitionNumber) are separate
-   * top-level CFn properties on this type and are deliberately not handled
-   * here; adding one means adding it to `handledProperties` too, or the
-   * #614 routing rule will keep sending the resource to Cloud Control.
+   * go-to-k/cdkd#5630 adds the top-level CFn `Tenancy` and
+   * `PlacementGroupName` (`Placement.Tenancy` / `.GroupName`); a malformed
+   * one is refused by `buildLaunchOnlyInstanceOptions` before this runs.
+   * HostId and Affinity (Dedicated Host) stay unhandled; adding one means
+   * adding it to `handledProperties` too, or the #614 routing rule will keep
+   * sending the resource to Cloud Control.
    */
   private buildPlacement(
     properties: Record<string, unknown>
-  ): { AvailabilityZone: string } | undefined {
+  ): { AvailabilityZone?: string; Tenancy?: Tenancy; GroupName?: string } | undefined {
+    const out: { AvailabilityZone?: string; Tenancy?: Tenancy; GroupName?: string } = {};
     const az = properties['AvailabilityZone'];
-    if (typeof az !== 'string' || az === '') return undefined;
-    return { AvailabilityZone: az };
+    if (typeof az === 'string' && az !== '') out.AvailabilityZone = az;
+    const tenancy = properties['Tenancy'];
+    if (typeof tenancy === 'string' && tenancy !== '') out.Tenancy = tenancy as Tenancy;
+    const group = properties['PlacementGroupName'];
+    if (typeof group === 'string' && group !== '') out.GroupName = group;
+    return Object.keys(out).length > 0 ? out : undefined;
   }
 
   /**
@@ -9757,8 +10617,15 @@ export class EC2Provider implements ResourceProvider {
    * go-to-k/cdkd#5630: the launch-only RunInstances inputs. `CpuOptions` and
    * `HibernationOptions` are create-only (a change replaces the instance via
    * the schema's `createOnlyProperties`); `InstanceInitiatedShutdownBehavior`
-   * also changes in place (`planInstanceMemberUpdates`). Member names match
-   * on both sides. A malformed value is refused before RunInstances, on a
+   * also changes in place (`planInstanceMemberUpdates`); `PrivateIpAddress`
+   * is create-only too. The same refusal also covers `Tenancy` /
+   * `PlacementGroupName` (sent by `buildPlacement`), `SourceDestCheck` (set
+   * after the launch) and `PropagateTagsToVolumeOnCreation`. `Ipv6AddressCount`
+   * / `Ipv6Addresses` are create-only; `PrivateDnsNameOptions` also changes in
+   * place; `AdditionalInfo` is reserved by EC2, which refuses the launch
+   * (`InvalidParameterValue: Bad property set`, measured), as it fails a
+   * CloudFormation stack. Member names
+   * match on both sides. A malformed value is refused before RunInstances, on a
    * rollback replay too: RunInstances rejects it every time, so the replay
    * could not succeed, and dropping it would launch an instance with CPU,
    * hibernation or shutdown settings the record never declared.
@@ -9771,6 +10638,11 @@ export class EC2Provider implements ResourceProvider {
     CpuOptions?: CpuOptionsRequest;
     HibernationOptions?: HibernationOptionsRequest;
     InstanceInitiatedShutdownBehavior?: ShutdownBehavior;
+    PrivateIpAddress?: string;
+    AdditionalInfo?: string;
+    Ipv6AddressCount?: number;
+    Ipv6Addresses?: Array<{ Ipv6Address: string }>;
+    PrivateDnsNameOptions?: PrivateDnsNameOptionsRequest;
   } {
     const cpu = properties['CpuOptions'];
     const hibernation = properties['HibernationOptions'];
@@ -9778,7 +10650,21 @@ export class EC2Provider implements ResourceProvider {
       configIntegerRefusal(cpu, 'CoreCount', `${resourceType} CpuOptions`, 1) ??
       configIntegerRefusal(cpu, 'ThreadsPerCore', `${resourceType} CpuOptions`, 1) ??
       configBooleanRefusal(hibernation, 'Configured', `${resourceType} HibernationOptions`) ??
-      configStringRefusal(properties, 'InstanceInitiatedShutdownBehavior', '', resourceType);
+      configStringRefusal(properties, 'InstanceInitiatedShutdownBehavior', '', resourceType) ??
+      // go-to-k/cdkd#5630: dropping one of these would launch an instance
+      // with a tenancy, placement group, address, source/destination check or
+      // volume tags the template never declared.
+      configStringRefusal(properties, 'Tenancy', '', resourceType) ??
+      configStringRefusal(properties, 'PlacementGroupName', '', resourceType) ??
+      configStringRefusal(properties, 'PrivateIpAddress', '', resourceType) ??
+      configBooleanRefusal(properties, 'SourceDestCheck', resourceType) ??
+      configBooleanRefusal(properties, 'PropagateTagsToVolumeOnCreation', resourceType) ??
+      // go-to-k/cdkd#5630: an address count, addresses, hostname options or
+      // the reserved AdditionalInfo the launch would otherwise silently lose.
+      configStringRefusal(properties, 'AdditionalInfo', '', resourceType) ??
+      configIntegerRefusal(properties, 'Ipv6AddressCount', resourceType, 0) ??
+      instanceIpv6AddressesRefusal(properties['Ipv6Addresses'], resourceType) ??
+      privateDnsNameOptionsRefusal(properties['PrivateDnsNameOptions'], resourceType);
     if (refusal !== undefined) {
       throw markNonRetryable(
         new ProvisioningError(
@@ -9806,6 +10692,22 @@ export class EC2Provider implements ResourceProvider {
     if (typeof shutdown === 'string' && shutdown !== '') {
       out.InstanceInitiatedShutdownBehavior = shutdown as ShutdownBehavior;
     }
+    const privateIp = properties['PrivateIpAddress'];
+    if (typeof privateIp === 'string' && privateIp !== '') out.PrivateIpAddress = privateIp;
+    const additionalInfo = properties['AdditionalInfo'];
+    if (typeof additionalInfo === 'string' && additionalInfo !== '') {
+      out.AdditionalInfo = additionalInfo;
+    }
+    const ipv6Count = coerceCfnInteger(properties['Ipv6AddressCount']);
+    if (ipv6Count !== undefined) out.Ipv6AddressCount = ipv6Count;
+    const ipv6Addresses = properties['Ipv6Addresses'];
+    if (Array.isArray(ipv6Addresses)) {
+      out.Ipv6Addresses = ipv6Addresses.map((a) => ({
+        Ipv6Address: (a as Record<string, unknown>)['Ipv6Address'] as string,
+      }));
+    }
+    const dnsOptions = privateDnsNameOptionsRequest(properties['PrivateDnsNameOptions']);
+    if (dnsOptions !== undefined) out.PrivateDnsNameOptions = dnsOptions;
     return out;
   }
 
@@ -10629,15 +11531,18 @@ export class EC2Provider implements ResourceProvider {
     resourceId: string,
     tags: CfnTagEntry[],
     logicalId: string,
-    mask: MaskerFn
+    mask: MaskerFn,
+    wrapSend: <T>(call: () => Promise<T>) => Promise<T> = (call) => call()
   ): Promise<void> {
     if (tags.length > 0) {
       try {
-        await this.ec2Client.send(
-          new CreateTagsCommand({
-            Resources: [resourceId],
-            Tags: tags.map((t) => ({ Key: t.Key, Value: t.Value })),
-          })
+        await wrapSend(() =>
+          this.ec2Client.send(
+            new CreateTagsCommand({
+              Resources: [resourceId],
+              Tags: tags.map((t) => ({ Key: t.Key, Value: t.Value })),
+            })
+          )
         );
         this.logger.debug(`Applied ${tags.length} tag(s) to ${logicalId}`);
       } catch (error) {
@@ -10899,6 +11804,46 @@ export class EC2Provider implements ResourceProvider {
   }
 
   /**
+   * go-to-k/cdkd#5630: run a call against the instance `RunInstances` JUST
+   * returned, retrying it while EC2 still answers `InvalidInstanceID.NotFound`.
+   *
+   * EC2's API is eventually consistent: a `DescribeInstances` (or modify) sent
+   * the moment `RunInstances` returns can answer that the id it just handed
+   * out does not exist (measured: us-east-1, 2026-11-04, under `--no-wait`,
+   * where no running-state waiter sits in between). Letting that reach
+   * `createInstance`'s wiring catch TERMINATES the healthy instance, and its
+   * `does not exist` message is retryable to the deploy engine, which re-runs
+   * the create under a new client token: a second launch, which for a fixed
+   * `PrivateIpAddress` / `Ipv6Addresses` collides with the address the
+   * terminating instance still holds (`InvalidIPAddress.InUse`). CloudFormation
+   * never relaunches an instance because a read lagged; retrying the READ is
+   * the fix. Any other error, and a NotFound outlasting the bounded budget
+   * (~40s), propagates unchanged.
+   */
+  private async whileLaunchedInstanceNotVisible<T>(
+    logicalId: string,
+    instanceId: string,
+    call: () => Promise<T>
+  ): Promise<T> {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await call();
+      } catch (error) {
+        if (
+          attempt >= LAUNCHED_INSTANCE_VISIBILITY_ATTEMPTS ||
+          !isNamedError(error, INSTANCE_NOT_FOUND_NAMES)
+        ) {
+          throw error;
+        }
+        this.logger.debug(
+          safeMsg`EC2 Instance ${logicalId} (${instanceId}) is not visible yet after launch (attempt ${String(attempt)}); retrying`
+        );
+        await this.sleep(Math.min(1000 * 2 ** (attempt - 1), 8000));
+      }
+    }
+  }
+
+  /**
    * Indirect sleep so unit tests can swap in a fake-timer-aware
    * implementation via `vi.useFakeTimers()` without monkey-patching
    * `setTimeout` globally.
@@ -10985,6 +11930,86 @@ export class EC2Provider implements ResourceProvider {
     return null;
   }
 
+  /** Recovery must not mistake an in-flight IPv6 association for absence. */
+  private subnetIpv6InTransition(subnet: Subnet): boolean {
+    return (subnet.Ipv6CidrBlockAssociationSet ?? []).some((association) => {
+      const state = association.Ipv6CidrBlockState?.State;
+      return (
+        state === undefined ||
+        state === 'associating' ||
+        state === 'disassociating' ||
+        state === 'failing'
+      );
+    });
+  }
+
+  async unsettledInTransition(
+    physicalId: string,
+    _logicalId: string,
+    resourceType: string,
+    names: ReadonlySet<string>
+  ): Promise<ReadonlySet<string>> {
+    if (resourceType !== 'AWS::EC2::Subnet' || !names.has('Ipv6CidrBlock')) return new Set();
+    try {
+      const response = await this.ec2Client.send(
+        new DescribeSubnetsCommand({ SubnetIds: [physicalId] })
+      );
+      const subnet = response.Subnets?.[0];
+      return !subnet || this.subnetIpv6InTransition(subnet)
+        ? new Set(['Ipv6CidrBlock'])
+        : new Set();
+    } catch {
+      return new Set(['Ipv6CidrBlock']);
+    }
+  }
+
+  async readUnsettled(
+    physicalId: string,
+    logicalId: string,
+    resourceType: string,
+    names: ReadonlySet<string>,
+    recordedProperties?: Record<string, unknown>
+  ): Promise<Record<string, unknown> | ResourceNotFound | undefined> {
+    // Bypass the ordinary read's not-found-message downgrade: recovery needs a
+    // failed read to refuse the update, never to manufacture a removal.
+    if (resourceType === 'AWS::EC2::Subnet') return this.readSubnetCurrentState(physicalId, names);
+    return this.readCurrentState(physicalId, logicalId, resourceType, recordedProperties);
+  }
+
+  /** Collapse only proven spelling equivalents; preserve the AWS bag for drift accept. */
+  async canonicalizeDriftPair(
+    resourceType: string,
+    baseline: Record<string, unknown>,
+    aws: Record<string, unknown>
+  ): Promise<{ baseline: Record<string, unknown>; aws: Record<string, unknown> }> {
+    const key = 'Ipv6CidrBlock';
+    if (resourceType === 'AWS::EC2::Subnet') {
+      const old = baseline[key];
+      const live = aws[key];
+      const canonical = typeof old === 'string' ? canonicalizeIpv6Cidr(old) : undefined;
+      if (
+        canonical !== undefined &&
+        typeof live === 'string' &&
+        canonical === canonicalizeIpv6Cidr(live)
+      ) {
+        return { baseline: { ...baseline, [key]: live }, aws };
+      }
+    }
+    return { baseline, aws };
+  }
+
+  canonicalizeUnsettledProperties(
+    resourceType: string,
+    properties: Record<string, unknown>
+  ): Record<string, unknown> {
+    if (resourceType !== 'AWS::EC2::Subnet') return properties;
+    const out = this.canonicalizeDesiredProperties(resourceType, properties);
+    const key = 'Ipv6CidrBlock';
+    const cidr = out[key];
+    const canonical = typeof cidr === 'string' ? canonicalizeIpv6Cidr(cidr) : undefined;
+    return canonical === undefined ? out : { ...out, [key]: canonical };
+  }
+
   /**
    * Read the AWS-current EC2 networking resource configuration in
    * CFn-property shape.
@@ -11028,7 +12053,8 @@ export class EC2Provider implements ResourceProvider {
    *    list of `SecurityGroups[].GroupId` for stable positional compare),
    *    `PrivateIpAddress`, `SourceDestCheck`, `Monitoring` (mapped from
    *    AWS `Monitoring.State` to CFn boolean), `Tenancy` (from
-   *    `Placement.Tenancy`), `IamInstanceProfile` (ARN form — v2 fallback
+   *    `Placement.Tenancy`), `PlacementGroupName` (from
+   *    `Placement.GroupName`), `IamInstanceProfile` (ARN form — v2 fallback
    *    state holding a name will fire one-time drift, resolved via
    *    `cdkd state refresh-observed`), `Tags` (filtered `aws:*`). For
    *    `BlockDeviceMappings`, `DescribeInstances` only returns
@@ -11189,8 +12215,18 @@ export class EC2Provider implements ResourceProvider {
       // template (i.e. every template that has the property at all, since
       // it is what routes CDK onto this shape). Declared unreadable, like
       // Lambda's Code (issue #1281).
+      // go-to-k/cdkd#5630: `PropagateTagsToVolumeOnCreation` is a
+      // CloudFormation-side switch with no EC2 attribute to read back.
+      // go-to-k/cdkd#5630: `AdditionalInfo`, `Ipv6AddressCount` and
+      // `Ipv6Addresses` are launch inputs the schema declares write-only.
       case 'AWS::EC2::Instance':
-        return ['NetworkInterfaces'];
+        return [
+          'NetworkInterfaces',
+          'PropagateTagsToVolumeOnCreation',
+          'AdditionalInfo',
+          'Ipv6AddressCount',
+          'Ipv6Addresses',
+        ];
       // go-to-k/cdkd#5633: DescribeVpcs names no IPAM pool; the netmask is
       // read back from the CIDR instead. A `monitor` encryption control
       // reports no exclusions at all (measured, us-east-1), so a declared
@@ -11251,6 +12287,11 @@ export class EC2Provider implements ResourceProvider {
     resourceType: string,
     properties: Record<string, unknown>
   ): Record<string, unknown> {
+    if (resourceType === 'AWS::EC2::Subnet') {
+      const dnsKey = 'EnableDns64';
+      const dns64 = coerceCfnBoolean(properties[dnsKey]);
+      return dns64 === undefined ? properties : { ...properties, [dnsKey]: dns64 };
+    }
     if (resourceType === 'AWS::EC2::SecurityGroupIngress') {
       // A no-op `onUnusable` rather than the logger: a diff must not throw, and
       // must not warn either — the provisioning path announces the identical
@@ -11361,11 +12402,18 @@ export class EC2Provider implements ResourceProvider {
   }
 
   private async readSubnetCurrentState(
-    physicalId: string
+    physicalId: string,
+    unsettledNames?: ReadonlySet<string>
   ): Promise<Record<string, unknown> | ResourceNotFound | undefined> {
     const resp = await this.ec2Client.send(new DescribeSubnetsCommand({ SubnetIds: [physicalId] }));
     const subnet = resp.Subnets?.[0];
     if (!subnet) return RESOURCE_NOT_FOUND;
+    if (unsettledNames?.has('Ipv6CidrBlock') && this.subnetIpv6InTransition(subnet)) {
+      throw new Error('Subnet IPv6 association is still in transition; retry after it has settled');
+    }
+    if (unsettledNames?.has('EnableDns64') && typeof subnet.EnableDns64 !== 'boolean') {
+      throw new Error('DescribeSubnets did not return EnableDns64; retry the subnet read');
+    }
 
     const result: Record<string, unknown> = {};
     if (subnet.VpcId !== undefined) result['VpcId'] = subnet.VpcId;
@@ -11376,6 +12424,11 @@ export class EC2Provider implements ResourceProvider {
     if (subnet.MapPublicIpOnLaunch !== undefined) {
       result['MapPublicIpOnLaunch'] = subnet.MapPublicIpOnLaunch;
     }
+    if (subnet.EnableDns64 !== undefined) result['EnableDns64'] = subnet.EnableDns64;
+    const ipv6 = subnet.Ipv6CidrBlockAssociationSet?.find(
+      (association) => association.Ipv6CidrBlockState?.State === 'associated'
+    );
+    if (ipv6?.Ipv6CidrBlock !== undefined) result['Ipv6CidrBlock'] = ipv6.Ipv6CidrBlock;
 
     return result;
   }
@@ -11693,10 +12746,30 @@ export class EC2Provider implements ResourceProvider {
     if (instance.HibernationOptions?.Configured !== undefined) {
       result['HibernationOptions'] = { Configured: instance.HibernationOptions.Configured };
     }
+    // go-to-k/cdkd#5630: the hostname options, same member names as
+    // CloudFormation's (DescribeInstances reports all three for every
+    // instance, the subnet's defaults when the template set none).
+    const dnsOptions = instance.PrivateDnsNameOptions;
+    if (dnsOptions !== undefined) {
+      const dns: Record<string, unknown> = {};
+      if (dnsOptions.HostnameType !== undefined) dns['HostnameType'] = dnsOptions.HostnameType;
+      if (dnsOptions.EnableResourceNameDnsARecord !== undefined) {
+        dns['EnableResourceNameDnsARecord'] = dnsOptions.EnableResourceNameDnsARecord;
+      }
+      if (dnsOptions.EnableResourceNameDnsAAAARecord !== undefined) {
+        dns['EnableResourceNameDnsAAAARecord'] = dnsOptions.EnableResourceNameDnsAAAARecord;
+      }
+      if (Object.keys(dns).length > 0) result['PrivateDnsNameOptions'] = dns;
+    }
 
     // Tenancy: lives under Placement.Tenancy.
     if (instance.Placement?.Tenancy !== undefined) {
       result['Tenancy'] = instance.Placement.Tenancy;
+    }
+    // go-to-k/cdkd#5630: PlacementGroupName lives under Placement.GroupName
+    // (AWS omits it, or reports it empty, for an instance in no group).
+    if (typeof instance.Placement?.GroupName === 'string' && instance.Placement.GroupName !== '') {
+      result['PlacementGroupName'] = instance.Placement.GroupName;
     }
 
     // IamInstanceProfile: CFn accepts either a name or an ARN. AWS returns
